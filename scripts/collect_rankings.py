@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import re
 import sys
@@ -9,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -28,7 +30,7 @@ MASTER_CSV = CONFIG_DIR / "product_master.csv"
 
 REQUEST_TIMEOUT = (20, 90)
 DETAIL_TIMEOUT = (15, 45)
-DETAIL_WAIT_SEC = 0.1
+DETAIL_WAIT_SEC = 0.05
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -95,6 +97,7 @@ def clean_text(text: str) -> str:
 def normalize_for_match(text: str) -> str:
     text = clean_text(text).lower()
     text = text.replace("＋", "+").replace("／", "/").replace("＆", "&")
+    text = text.replace("　", " ")
     text = re.sub(r"[ \t\r\n\-ー―‐_/\\.,，。・!！?？:：;；'\"“”‘’()\[\]【】『』<>＜＞|]+", "", text)
     return text
 
@@ -169,62 +172,6 @@ def safe_get_html(session: requests.Session, url: str, timeout=REQUEST_TIMEOUT, 
     raise RuntimeError(f"requests取得失敗: {url} / {repr(last_error)}")
 
 
-def extract_price_from_text(text: str) -> Optional[int]:
-    text = clean_text(text)
-
-    patterns = [
-        r"税抜[^\d]{0,20}([\d,]+)\s*円",
-        r"([\d,]+)\s*円[^\n]{0,20}税抜",
-        r"クーポン[^\d]{0,20}([\d,]+)\s*円",
-        r"([\d,]+)\s*円[^\n]{0,20}クーポン",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text)
-        if m:
-            return int(m.group(1).replace(",", ""))
-
-    m = re.search(r"([\d,]+)\s*円[^\n]{0,20}税込", text)
-    if m:
-        inclusive = int(m.group(1).replace(",", ""))
-        return math.floor(inclusive / 1.1)
-
-    m = re.search(r"([\d,]+)\s*円", text)
-    if m:
-        return int(m.group(1).replace(",", ""))
-
-    return None
-
-
-def fetch_detail_title(session: requests.Session, url: str, fallback_title: str) -> str:
-    if not url:
-        return fallback_title
-
-    try:
-        html = safe_get_html(session, url, timeout=DETAIL_TIMEOUT, attempts=2)
-        soup = BeautifulSoup(html, "lxml")
-
-        og_title = soup.find("meta", property="og:title")
-        if og_title and og_title.get("content"):
-            return clean_text(og_title["content"])
-
-        title_tag = soup.find("title")
-        if title_tag:
-            title_text = clean_text(title_tag.get_text(" ", strip=True))
-            if title_text:
-                return title_text
-
-        h1 = soup.find("h1")
-        if h1:
-            h1_text = clean_text(h1.get_text(" ", strip=True))
-            if h1_text:
-                return h1_text
-
-    except Exception:
-        return fallback_title
-
-    return fallback_title
-
-
 def best_fuzzy_score(master_norm: str, candidate_norm: str) -> float:
     if not master_norm or not candidate_norm:
         return 0.0
@@ -251,7 +198,7 @@ def is_match(master: ProductMaster, item: RankingItem) -> Tuple[bool, float]:
     if not scores:
         return False, 0.0
     score = max(scores)
-    return score >= 70, score
+    return score >= 62, score
 
 
 def next_wednesday(search_date: date) -> date:
@@ -296,263 +243,185 @@ def build_common_fields(search_dt: date) -> Dict[str, str]:
     }
 
 
-def extract_rakuten_from_playwright(page, category: str) -> List[RankingItem]:
-    js = """
-    () => {
-      const rows = [];
-      const seen = new Set();
+def extract_price_from_text(text: str) -> Optional[int]:
+    text = clean_text(text)
 
-      function txt(el) {
-        return (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
-      }
+    patterns = [
+        r"税抜[^\d]{0,30}([\d,]+)\s*円",
+        r"([\d,]+)\s*円[^\n]{0,30}税抜",
+        r"クーポン[^\d]{0,30}([\d,]+)\s*円",
+        r"([\d,]+)\s*円[^\n]{0,30}クーポン",
+        r"限定[^\d]{0,20}([\d,]+)\s*円",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text)
+        if m:
+            return int(m.group(1).replace(",", ""))
 
-      function firstPrice(text) {
-        const m = text.match(/([\\d,]+)\\s*円/);
-        return m ? Number(m[1].replace(/,/g, '')) : null;
-      }
+    m = re.search(r"([\d,]+)\s*円[^\n]{0,20}税込", text)
+    if m:
+        inclusive = int(m.group(1).replace(",", ""))
+        return math.floor(inclusive / 1.1)
 
-      const links = [...document.querySelectorAll('a[href*="item.rakuten.co.jp"]')];
+    m = re.search(r"([\d,]+)\s*円", text)
+    if m:
+        return int(m.group(1).replace(",", ""))
 
-      for (const a of links) {
-        const href = a.href || '';
-        const title = txt(a);
-        if (!href || !title) continue;
-
-        let node = a;
-        let box = null;
-        for (let i = 0; i < 10 && node; i++) {
-          const t = txt(node);
-          if (/\\b\\d{1,3}\\s*位\\b/.test(t) || /\\d{1,3}位/.test(t)) {
-            box = node;
-          }
-          node = node.parentElement;
-        }
-
-        const text = txt(box || a.parentElement || a);
-        const rankMatch = text.match(/(?:^|\\s)(\\d{1,3})\\s*位(?:\\s|$)/) || text.match(/(\\d{1,3})位/);
-        if (!rankMatch) continue;
-
-        const rank = Number(rankMatch[1]);
-        if (!rank || rank > 100) continue;
-
-        const key = `${rank}__${href}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        rows.push({
-          rank: rank,
-          title: title,
-          href: href,
-          text: text,
-          price: firstPrice(text)
-        });
-      }
-
-      rows.sort((a, b) => a.rank - b.rank);
-
-      const dedup = [];
-      const usedRank = new Set();
-      for (const row of rows) {
-        if (usedRank.has(row.rank)) continue;
-        usedRank.add(row.rank);
-        dedup.push(row);
-      }
-
-      return dedup.slice(0, 100);
-    }
-    """
-
-    raw = page.evaluate(js)
-    items: List[RankingItem] = []
-    for row in raw:
-        items.append(
-            RankingItem(
-                mall="楽天",
-                category=category,
-                rank=int(row["rank"]),
-                listing_title=clean_text(row["title"]),
-                detail_title=clean_text(row["title"]),
-                store_name="",
-                price_value=parse_int_or_none(row["price"]),
-                item_url=row["href"],
-            )
-        )
-    return items
+    return None
 
 
-def fetch_rakuten_rankings(category: str, urls: List[str], session: requests.Session) -> List[RankingItem]:
-    all_items: List[RankingItem] = []
+def extract_price_from_html(html: str) -> Optional[int]:
+    soup = BeautifulSoup(html, "lxml")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
+    selectors = [
+        ('meta[property="product:price:amount"]', "content"),
+        ('meta[itemprop="price"]', "content"),
+        ('meta[name="twitter:data1"]', "content"),
+        ('span[itemprop="price"]', "content"),
+        ('span[itemprop="price"]', "data-price"),
+    ]
+    for selector, attr in selectors:
+        tag = soup.select_one(selector)
+        if tag:
+            value = tag.get(attr)
+            price = parse_int_or_none(value)
+            if price:
+                return price
 
-        for url in urls:
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=120000)
-                page.wait_for_timeout(5000)
-                items = extract_rakuten_from_playwright(page, category)
-                all_items.extend(items)
-            except Exception:
+    for script in soup.find_all("script", type="application/ld+json"):
+        txt = script.string or script.get_text()
+        if not txt:
+            continue
+        try:
+            obj = json.loads(txt)
+            candidates = obj if isinstance(obj, list) else [obj]
+            for entry in candidates:
+                if not isinstance(entry, dict):
+                    continue
+                if "offers" in entry:
+                    offers = entry["offers"]
+                    offers_list = offers if isinstance(offers, list) else [offers]
+                    for offer in offers_list:
+                        if isinstance(offer, dict) and "price" in offer:
+                            price = parse_int_or_none(offer.get("price"))
+                            if price:
+                                return price
+                if "price" in entry:
+                    price = parse_int_or_none(entry.get("price"))
+                    if price:
+                        return price
+        except Exception:
+            continue
+
+    text = clean_text(soup.get_text(" ", strip=True))
+    return extract_price_from_text(text)
+
+
+def fetch_detail_info(session: requests.Session, url: str, fallback_title: str, fallback_price: Optional[int]) -> Tuple[str, Optional[int]]:
+    if not url:
+        return fallback_title, fallback_price
+
+    try:
+        html = safe_get_html(session, url, timeout=DETAIL_TIMEOUT, attempts=2)
+        soup = BeautifulSoup(html, "lxml")
+
+        title = fallback_title
+
+        og_title = soup.find("meta", property="og:title")
+        if og_title and og_title.get("content"):
+            title = clean_text(og_title["content"])
+        else:
+            h1 = soup.find("h1")
+            if h1:
+                h1_text = clean_text(h1.get_text(" ", strip=True))
+                if h1_text:
+                    title = h1_text
+            else:
+                title_tag = soup.find("title")
+                if title_tag:
+                    title_text = clean_text(title_tag.get_text(" ", strip=True))
+                    if title_text:
+                        title = title_text
+
+        price = fallback_price
+        if price is None:
+            price = extract_price_from_html(html)
+
+        return title, price
+    except Exception:
+        return fallback_title, fallback_price
+
+
+def derive_product_name_from_title(title: str) -> str:
+    s = clean_text(title)
+    if not s:
+        return ""
+
+    while True:
+        new_s = re.sub(r"^[\[\(【『「][^】』」\]\)]{1,30}[\]）】』」]\s*", "", s)
+        if new_s == s:
+            break
+        s = new_s.strip()
+
+    stop_words = [
+        "ウルトラファインバブル",
+        "節水シャワー",
+        "6段階",
+        "ミスト",
+        "増圧",
+        "手元止水",
+        "高洗浄力",
+        "毛穴",
+        "汚れ",
+        "美肌",
+        "美髪",
+        "新生活",
+        "プレゼント",
+        "ギフト",
+        "スキンケア",
+        "節水",
+        "保温",
+        "保湿",
+        "頭皮",
+        "洗浄力",
+        "保証",
+        "爆買",
+        "公式",
+        "ポイント",
+    ]
+
+    cut_pos = len(s)
+    for word in stop_words:
+        pos = s.find(word)
+        if pos > 0:
+            cut_pos = min(cut_pos, pos)
+
+    s = s[:cut_pos].strip(" ・|｜-–—/")
+
+    if len(s) > 28:
+        parts = s.split(" ")
+        compact = []
+        for part in parts:
+            if not part:
                 continue
-
-        browser.close()
-
-    dedup_by_rank: Dict[int, RankingItem] = {}
-    for item in sorted(all_items, key=lambda x: x.rank):
-        if item.rank <= 100 and item.rank not in dedup_by_rank:
-            if not item.detail_title and item.listing_title:
-                item.detail_title = item.listing_title
-            if item.item_url:
-                detail_title = fetch_detail_title(session, item.item_url, item.listing_title)
-                item.detail_title = detail_title
-                if item.price_value is None:
-                    item.price_value = extract_price_from_text(detail_title)
-                time.sleep(DETAIL_WAIT_SEC)
-            dedup_by_rank[item.rank] = item
-
-    return [dedup_by_rank[r] for r in sorted(dedup_by_rank.keys())]
-
-
-def _extract_yahoo_items_from_page(page, category: str) -> List[RankingItem]:
-    js = """
-    () => {
-      const anchors = [...document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]')];
-      const rows = [];
-      const seen = new Set();
-
-      function normalizeText(s) {
-        return (s || '').replace(/\\s+/g, ' ').trim();
-      }
-
-      function firstPrice(text) {
-        const m = text.match(/([\\d,]+)\\s*円/);
-        return m ? Number((m[1] || '').replace(/,/g, '')) : null;
-      }
-
-      for (const a of anchors) {
-        const href = a.href || '';
-        const title = normalizeText(a.textContent || '');
-        if (!href || !title) continue;
-
-        let node = a;
-        let chosen = null;
-
-        for (let i = 0; i < 10 && node; i++) {
-          const txt = normalizeText(node.innerText || '');
-          if (/\\d{1,3}\\s*位/.test(txt)) {
-            chosen = node;
-          }
-          node = node.parentElement;
-        }
-
-        const text = normalizeText((chosen || a).innerText || (chosen || a).textContent || '');
-        const rankMatch = text.match(/(?:^|\\s)(\\d{1,3})\\s*位(?:\\s|$)/) || text.match(/(\\d{1,3})位/);
-        if (!rankMatch) continue;
-
-        const rank = Number(rankMatch[1]);
-        if (!rank || rank > 100) continue;
-
-        const key = `${rank}__${href}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        rows.push({
-          rank: rank,
-          title: title,
-          href: href,
-          text: text,
-          price: firstPrice(text)
-        });
-      }
-
-      rows.sort((a, b) => a.rank - b.rank);
-
-      const dedup = [];
-      const usedRank = new Set();
-      for (const row of rows) {
-        if (usedRank.has(row.rank)) continue;
-        usedRank.add(row.rank);
-        dedup.push(row);
-      }
-
-      return dedup.slice(0, 100);
-    }
-    """
-
-    raw = page.evaluate(js)
-    items: List[RankingItem] = []
-    for row in raw:
-        items.append(
-            RankingItem(
-                mall="Yahoo!",
-                category=category,
-                rank=int(row["rank"]),
-                listing_title=clean_text(row["title"]),
-                detail_title=clean_text(row["title"]),
-                store_name="",
-                price_value=parse_int_or_none(row["price"]),
-                item_url=row["href"],
-            )
-        )
-    return items
-
-
-def fetch_yahoo_rankings(category: str, url: str, session: requests.Session) -> List[RankingItem]:
-    items: List[RankingItem] = []
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
-        page.goto(url, wait_until="domcontentloaded", timeout=120000)
-        page.wait_for_timeout(5000)
-
-        for _ in range(20):
-            current = _extract_yahoo_items_from_page(page, category)
-            if len(current) > len(items):
-                items = current
-            if len(items) >= 100:
+            trial = " ".join(compact + [part]).strip()
+            if len(trial) > 28:
                 break
+            compact.append(part)
+        if compact:
+            s = " ".join(compact)
 
-            try:
-                more_button = page.get_by_text("もっと見る", exact=True)
-                if more_button.count() == 0 or not more_button.first.is_visible():
-                    break
-                more_button.first.click(timeout=5000)
-                page.wait_for_timeout(2000)
-            except PlaywrightTimeoutError:
-                break
-            except Exception:
-                break
-
-        if not items:
-            items = _extract_yahoo_items_from_page(page, category)
-
-        browser.close()
-
-    enriched: List[RankingItem] = []
-    for item in items[:100]:
-        detail_title = fetch_detail_title(session, item.item_url, item.listing_title)
-        item.detail_title = detail_title
-        if item.price_value is None:
-            item.price_value = extract_price_from_text(detail_title)
-        time.sleep(DETAIL_WAIT_SEC)
-        enriched.append(item)
-
-    return enriched[:100]
+    return clean_text(s)
 
 
-def choose_top1_name(ranking_items: List[RankingItem], masters: List[ProductMaster]) -> str:
-    top_item = next((x for x in sorted(ranking_items, key=lambda i: i.rank) if x.rank == 1), None)
+def choose_top1_name(top_item: Optional[RankingItem], masters: List[ProductMaster]) -> str:
     if top_item is None:
         return ""
 
     target_masters = [m for m in masters if m.product_name != "各チャネルの1位"]
-    if not target_masters:
-        return top_item.detail_title or top_item.listing_title
-
     best_name = ""
     best_score = -1.0
+
     for master in target_masters:
         score = max(
             best_fuzzy_score(master.norm_name, normalize_for_match(top_item.listing_title)),
@@ -565,12 +434,11 @@ def choose_top1_name(ranking_items: List[RankingItem], masters: List[ProductMast
     if best_score >= 70:
         return best_name
 
-    return clean_text(top_item.detail_title or top_item.listing_title)
+    return derive_product_name_from_title(top_item.detail_title or top_item.listing_title)
 
 
 def pick_best_item_for_master(master: ProductMaster, ranking_items: List[RankingItem]) -> Optional[RankingItem]:
     matched_items: List[Tuple[RankingItem, float]] = []
-
     for item in ranking_items:
         matched, score = is_match(master, item)
         if matched:
@@ -580,13 +448,12 @@ def pick_best_item_for_master(master: ProductMaster, ranking_items: List[Ranking
         matched_items.sort(key=lambda x: (x[0].rank, -x[1]))
         return matched_items[0][0]
 
-    master_norm = master.norm_name
-    best_score = -1.0
     best_item: Optional[RankingItem] = None
+    best_score = -1.0
     for item in ranking_items:
         score = max(
-            best_fuzzy_score(master_norm, normalize_for_match(item.listing_title)),
-            best_fuzzy_score(master_norm, normalize_for_match(item.detail_title)),
+            best_fuzzy_score(master.norm_name, normalize_for_match(item.listing_title)),
+            best_fuzzy_score(master.norm_name, normalize_for_match(item.detail_title)),
         )
         if score > best_score:
             best_score = score
@@ -598,6 +465,267 @@ def pick_best_item_for_master(master: ProductMaster, ranking_items: List[Ranking
     return None
 
 
+def enrich_items_with_detail(session: requests.Session, items: List[RankingItem]) -> List[RankingItem]:
+    enriched: List[RankingItem] = []
+    for item in items:
+        detail_title, detail_price = fetch_detail_info(
+            session=session,
+            url=item.item_url,
+            fallback_title=item.listing_title,
+            fallback_price=item.price_value,
+        )
+        item.detail_title = clean_text(detail_title or item.listing_title)
+        item.price_value = detail_price if detail_price is not None else item.price_value
+        enriched.append(item)
+        time.sleep(DETAIL_WAIT_SEC)
+    return enriched
+
+
+def fetch_rakuten_rankings(category: str, urls: List[str], session: requests.Session) -> List[RankingItem]:
+    raw_items: List[RankingItem] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
+
+        js = """
+        () => {
+          function txt(el) {
+            return (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+          }
+
+          function getCard(el) {
+            let node = el;
+            while (node && node !== document.body) {
+              const text = txt(node);
+              const itemLinks = node.querySelectorAll ? node.querySelectorAll('a[href*="item.rakuten.co.jp"]').length : 0;
+              if (text.includes('円') && itemLinks >= 1 && itemLinks <= 3) {
+                return node;
+              }
+              node = node.parentElement;
+            }
+            return el.parentElement || el;
+          }
+
+          const links = [...document.querySelectorAll('a[href*="item.rakuten.co.jp"]')];
+          const rows = [];
+          const seen = new Set();
+
+          for (const a of links) {
+            const href = a.href || '';
+            if (!href) continue;
+
+            let title = txt(a);
+            if (!title) {
+              const img = a.querySelector('img[alt]');
+              title = img ? txt(img) : '';
+            }
+            if (!title) continue;
+
+            const key = href;
+            if (seen.has(key)) continue;
+            seen.add(key);
+
+            const card = getCard(a);
+            const cardText = txt(card);
+            const storeLinks = [...(card.querySelectorAll ? card.querySelectorAll('a[href*="www.rakuten.co.jp"]') : [])];
+            let storeName = '';
+            for (const s of storeLinks) {
+              const t = txt(s);
+              if (t && !t.includes('楽天市場') && !t.includes('bookmark')) {
+                storeName = t;
+                break;
+              }
+            }
+
+            rows.push({
+              href: href,
+              title: title,
+              cardText: cardText,
+              storeName: storeName
+            });
+          }
+
+          return rows;
+        }
+        """
+
+        for url in urls:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=120000)
+                page.wait_for_timeout(4000)
+                rows = page.evaluate(js)
+                for row in rows:
+                    raw_items.append(
+                        RankingItem(
+                            mall="楽天",
+                            category=category,
+                            rank=0,
+                            listing_title=clean_text(row.get("title", "")),
+                            detail_title=clean_text(row.get("title", "")),
+                            store_name=clean_text(row.get("storeName", "")),
+                            price_value=extract_price_from_text(row.get("cardText", "")),
+                            item_url=row.get("href", ""),
+                        )
+                    )
+            except Exception:
+                continue
+
+        browser.close()
+
+    seen_href = set()
+    ordered_items: List[RankingItem] = []
+    for item in raw_items:
+        href = item.item_url
+        if not href or href in seen_href:
+            continue
+        seen_href.add(href)
+        ordered_items.append(item)
+
+    ordered_items = ordered_items[:100]
+    for i, item in enumerate(ordered_items, start=1):
+        item.rank = i
+
+    return enrich_items_with_detail(session, ordered_items)
+
+
+def fetch_yahoo_rankings(category: str, url: str, session: requests.Session) -> List[RankingItem]:
+    items: List[RankingItem] = []
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
+        page.goto(url, wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_timeout(5000)
+
+        for _ in range(20):
+            try:
+                current_count = len(_extract_yahoo_general_rows(page))
+                if current_count >= 100:
+                    break
+                more_button = page.get_by_text("もっと見る", exact=True)
+                if more_button.count() == 0 or not more_button.first.is_visible():
+                    break
+                more_button.first.click(timeout=5000)
+                page.wait_for_timeout(2000)
+            except PlaywrightTimeoutError:
+                break
+            except Exception:
+                break
+
+        rows = _extract_yahoo_general_rows(page)
+        browser.close()
+
+    for i, row in enumerate(rows[:100], start=1):
+        items.append(
+            RankingItem(
+                mall="Yahoo!",
+                category=category,
+                rank=i,
+                listing_title=clean_text(row.get("title", "")),
+                detail_title=clean_text(row.get("title", "")),
+                store_name=clean_text(row.get("storeName", "")),
+                price_value=parse_int_or_none(row.get("price")),
+                item_url=row.get("href", ""),
+            )
+        )
+
+    return enrich_items_with_detail(session, items)
+
+
+def _extract_yahoo_general_rows(page) -> List[Dict[str, object]]:
+    js = """
+    () => {
+      function txt(el) {
+        return (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
+      }
+
+      function isBefore(a, b) {
+        if (!a || !b) return true;
+        return !!(a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING);
+      }
+
+      function getCard(el) {
+        let node = el;
+        while (node && node !== document.body) {
+          const text = txt(node);
+          const itemLinks = node.querySelectorAll ? node.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]').length : 0;
+          if (text.includes('円') && itemLinks >= 1 && itemLinks <= 4) {
+            return node;
+          }
+          node = node.parentElement;
+        }
+        return el.parentElement || el;
+      }
+
+      const brandHeading = [...document.querySelectorAll('*')].find(el => txt(el) === 'ブランド別 ランキング');
+      const links = [...document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]')];
+      const rows = [];
+      const seen = new Set();
+
+      for (const a of links) {
+        if (!isBefore(a, brandHeading)) continue;
+
+        const href = a.href || '';
+        if (!href) continue;
+
+        let title = txt(a);
+        if (!title) {
+          const img = a.querySelector('img[alt]');
+          title = img ? txt(img) : '';
+        }
+        if (!title) continue;
+
+        const card = getCard(a);
+        const cardText = txt(card);
+        if (!cardText.includes('円')) continue;
+
+        const key = href;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        const storeLinks = [...(card.querySelectorAll ? card.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]') : [])];
+        let storeName = '';
+        for (const s of storeLinks) {
+          const t = txt(s);
+          if (t && t !== title) {
+            const href2 = s.href || '';
+            if (href2 && href2.includes('store.shopping.yahoo.co.jp') && !href2.includes('/item/')) {
+              storeName = t;
+              break;
+            }
+          }
+        }
+
+        const priceMatch = cardText.match(/([\\d,]+)\\s*円/);
+        rows.push({
+          href: href,
+          title: title,
+          storeName: storeName,
+          price: priceMatch ? priceMatch[1] : null
+        });
+      }
+
+      return rows;
+    }
+    """
+    rows = page.evaluate(js)
+
+    dedup_rows: List[Dict[str, object]] = []
+    seen_href = set()
+    for row in rows:
+        href = row.get("href", "")
+        title = clean_text(str(row.get("title", "")))
+        if not href or not title:
+            continue
+        if href in seen_href:
+            continue
+        seen_href.add(href)
+        dedup_rows.append(row)
+
+    return dedup_rows
+
+
 def build_output_rows(
     mall: str,
     category: str,
@@ -607,7 +735,9 @@ def build_output_rows(
 ) -> List[Dict[str, str]]:
     common = build_common_fields(search_date_value)
     rows: List[Dict[str, str]] = []
-    top1_name = choose_top1_name(ranking_items, masters)
+
+    top_item = ranking_items[0] if ranking_items else None
+    top1_name = choose_top1_name(top_item, masters)
 
     for master in masters:
         if master.product_name == "各チャネルの1位":
@@ -620,14 +750,14 @@ def build_output_rows(
                     "カテゴリ": category,
                     "商品名": master.product_name,
                     "セラー or 公式": "",
-                    "ランキング": "1" if top1_name else "圏外",
+                    "ランキング": "1" if top_item else "圏外",
                     "各チャネルの1位": top1_name,
                     "配信日": common["配信日"],
                     "年月": common["年月"],
                     "検索実行日": common["検索実行日"],
                     "定価": "" if master.list_price is None else f"{master.list_price:,}",
-                    "販売価格": "",
-                    "商品タイトル": top1_name,
+                    "販売価格": "" if not top_item or top_item.price_value is None else f"{top_item.price_value:,}",
+                    "商品タイトル": "" if not top_item else clean_text(top_item.detail_title or top_item.listing_title),
                 }
             )
             continue
@@ -644,7 +774,7 @@ def build_output_rows(
                 "商品名": master.product_name,
                 "セラー or 公式": "",
                 "ランキング": str(best_item.rank) if best_item else "圏外",
-                "各チャネルの1位": top1_name,
+                "各チャネルの1位": "",
                 "配信日": common["配信日"],
                 "年月": common["年月"],
                 "検索実行日": common["検索実行日"],
