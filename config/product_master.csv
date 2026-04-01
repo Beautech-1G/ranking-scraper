@@ -1,19 +1,19 @@
-カテゴリ,商品名,定価
+カテゴリ,商品名,定価,メーカー名①,メーカー名②,固有のキー
 シャワー,各チャネルの1位,0
-シャワー,ReFa FINE BUBBLE U+,35000
-シャワー,ReFa FINE BUBBLE U,30000
-シャワー,ReFa FINE BUBBLE VEIL,33000
-シャワー,ReFa FINE BUBBLE PURE,30000
-シャワー,ReFa FINE BUBBLE DIA 150,68000
-シャワー,ReFa FINE BUBBLE DIA 120,48000
-シャワー,ReFa FINE BUBBLE DIA 90,35000
-シャワー,ファインバブルクリア,23760
-シャワー,アイリスオーヤマ,17380
-シャワー,MYTREX HIHO FINE BUBBLE＋,23980
-シャワー,MYTREX HIHO FINE BUBBLE＋e,36850
-シャワー,ミラブル plus,44990
-シャワー,ミラブル Zero,49390
-シャワー,ミラブル 爽,29700
-シャワー,ミラブル 潤,39600
-シャワー,ミラブル 艶,44880
-シャワー,ファインベール,33660
+シャワー,ReFa FINE BUBBLE U+,35000,ReFa,リファ,U+
+シャワー,ReFa FINE BUBBLE U,30000,ReFa,リファ,U
+シャワー,ReFa FINE BUBBLE VEIL,33000,ReFa,リファ,VEIL
+シャワー,ReFa FINE BUBBLE PURE,30000,ReFa,リファ,PURE
+シャワー,ReFa FINE BUBBLE DIA 150,68000,ReFa,リファ,150
+シャワー,ReFa FINE BUBBLE DIA 120,48000,ReFa,リファ,120
+シャワー,ReFa FINE BUBBLE DIA 90,35000,ReFa,リファ,90
+シャワー,ファインバブルクリア,23760,SALONIA,サロニア,クリア
+シャワー,クレンジングシャワーヘッド,17380,MiCOLA,アイリスオーヤマ,アイリスオーヤマ
+シャワー,MYTREX HIHO FINE BUBBLE＋,23980,MYTREX,マイトレックス,＋
+シャワー,MYTREX HIHO FINE BUBBLE＋e,36850,MYTREX,マイトレックス,＋e
+シャワー,ミラブル plus,44990,Science,ミラブル,plus
+シャワー,ミラブル Zero,49390,Science,ミラブル,Zero
+シャワー,ミラブル 爽,29700,Science,ミラブル,爽
+シャワー,ミラブル 潤,39600,Science,ミラブル,潤
+シャワー,ミラブル 艶,44880,Science,ミラブル,艶
+シャワー,ファインベール,33660,Panasonic,パナソニック,EH-SH50
