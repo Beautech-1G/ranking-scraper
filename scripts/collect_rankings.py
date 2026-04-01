@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 import sys
 import time
@@ -18,6 +17,8 @@ from bs4 import BeautifulSoup
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from rapidfuzz import fuzz
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from zoneinfo import ZoneInfo
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -26,8 +27,9 @@ CONFIG_DIR = BASE_DIR / "config"
 DATA_DIR = BASE_DIR / "data"
 MASTER_CSV = CONFIG_DIR / "product_master.csv"
 
-REQUEST_TIMEOUT = 30
-DETAIL_WAIT_SEC = 0.3
+REQUEST_TIMEOUT = (20, 90)
+DETAIL_TIMEOUT = (15, 45)
+DETAIL_WAIT_SEC = 0.2
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -37,11 +39,12 @@ USER_AGENT = (
 HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 WEEKDAY_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
-# 今回は1カテゴリだけ先に実装
 CATEGORY_CONFIG = {
     "シャワー": {
         "rakuten_urls": [
@@ -104,17 +107,7 @@ def normalize_for_match(text: str) -> str:
     for old, new in replacements.items():
         text = text.replace(old, new)
 
-    # 記号・スペース・ハイフン揺れ吸収
     text = re.sub(r"[ \t\r\n\-ー―‐_/\\.,，。・!！?？:：;；'\"“”‘’()\[\]【】『』<>＜＞|]+", "", text)
-
-    # よくある語の揺れ吸収
-    text = text.replace("finebubble", "finebubble")
-    text = text.replace("refa", "refa")
-    text = text.replace("mtg", "mtg")
-    text = text.replace("mytrex", "mytrex")
-    text = text.replace("zero", "zero")
-    text = text.replace("plus", "plus")
-
     return text
 
 
@@ -156,9 +149,64 @@ def load_master() -> List[ProductMaster]:
 
 
 def get_requests_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
+
     session = requests.Session()
     session.headers.update(HEADERS)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
+
+
+def safe_get_html(session: requests.Session, url: str, timeout=REQUEST_TIMEOUT, attempts: int = 3) -> str:
+    last_error: Optional[Exception] = None
+
+    for i in range(1, attempts + 1):
+        try:
+            print(f"[INFO] GET {url} attempt={i}/{attempts}")
+            res = session.get(url, timeout=timeout)
+            res.raise_for_status()
+            if res.text:
+                return res.text
+        except Exception as e:
+            last_error = e
+            wait_sec = min(3 * i, 10)
+            print(f"[WARN] GET失敗: {url} / attempt={i} / error={repr(e)} / wait={wait_sec}s")
+            time.sleep(wait_sec)
+
+    raise RuntimeError(f"requests取得失敗: {url} / {repr(last_error)}")
+
+
+def safe_get_html_with_playwright(url: str, wait_ms: int = 5000) -> str:
+    print(f"[INFO] Playwright fallback GET {url}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
+        page.goto(url, wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_timeout(wait_ms)
+        html = page.content()
+        browser.close()
+    return html
+
+
+def get_html_resilient(session: requests.Session, url: str, use_playwright_fallback: bool = True) -> str:
+    try:
+        return safe_get_html(session, url)
+    except Exception as e:
+        print(f"[WARN] requestsで取得失敗: {url} / error={repr(e)}")
+        if not use_playwright_fallback:
+            raise
+        return safe_get_html_with_playwright(url)
 
 
 def collect_text_with_img_alt(tag) -> str:
@@ -175,8 +223,7 @@ def collect_text_with_img_alt(tag) -> str:
         if alt:
             parts.append(alt)
 
-    joined = clean_text(" ".join(parts))
-    return joined
+    return clean_text(" ".join(parts))
 
 
 def extract_rank_from_text(text: str) -> Optional[int]:
@@ -190,23 +237,20 @@ def extract_rank_from_text(text: str) -> Optional[int]:
 def extract_price_from_text(text: str) -> Optional[int]:
     text = clean_text(text)
 
-    # 税抜価格が明示されていれば優先
     patterns = [
-        r"税抜[^\d]{0,10}([\d,]+)\s*円",
-        r"([\d,]+)\s*円[^\n]{0,10}税抜",
+        r"税抜[^\d]{0,15}([\d,]+)\s*円",
+        r"([\d,]+)\s*円[^\n]{0,15}税抜",
     ]
     for pattern in patterns:
         m = re.search(pattern, text)
         if m:
             return int(m.group(1).replace(",", ""))
 
-    # 税込明記なら税抜換算（小数点以下切り捨て）
-    m = re.search(r"([\d,]+)\s*円[^\n]{0,10}税込", text)
+    m = re.search(r"([\d,]+)\s*円[^\n]{0,15}税込", text)
     if m:
         inclusive = int(m.group(1).replace(",", ""))
         return math.floor(inclusive / 1.1)
 
-    # 明示がなければページ上で取得できた価格をそのまま採用
     m = re.search(r"([\d,]+)\s*円(?:\s*[~～〜])?", text)
     if m:
         return int(m.group(1).replace(",", ""))
@@ -219,9 +263,8 @@ def fetch_detail_title(session: requests.Session, url: str, fallback_title: str)
         return fallback_title
 
     try:
-        res = session.get(url, timeout=REQUEST_TIMEOUT)
-        res.raise_for_status()
-        soup = BeautifulSoup(res.text, "lxml")
+        html = get_html_resilient(session, url, use_playwright_fallback=False)
+        soup = BeautifulSoup(html, "lxml")
 
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
@@ -239,7 +282,8 @@ def fetch_detail_title(session: requests.Session, url: str, fallback_title: str)
             if h1_text:
                 return h1_text
 
-    except Exception:
+    except Exception as e:
+        print(f"[WARN] 詳細ページ取得失敗: {url} / error={repr(e)}")
         return fallback_title
 
     return fallback_title
@@ -273,8 +317,6 @@ def is_match(master: ProductMaster, item: RankingItem) -> Tuple[bool, float]:
         return False, 0.0
 
     score = max(scores)
-
-    # 比較的広めに許容
     matched = score >= 78
     return matched, score
 
@@ -297,15 +339,13 @@ def extract_top1_name(top_item: Optional[RankingItem], masters_in_category: List
     if best_score >= 78:
         return best_name
 
-    # マスタに寄らない場合は一覧タイトルをそのまま返す
     return top_item.listing_title or top_item.detail_title
 
 
 def next_wednesday(search_date: date) -> date:
-    # 木曜実行想定で +6日
     for i in range(1, 8):
         d = search_date + timedelta(days=i)
-        if d.weekday() == 2:  # Wednesday
+        if d.weekday() == 2:
             return d
     return search_date + timedelta(days=6)
 
@@ -362,7 +402,7 @@ def parse_rakuten_cards_from_html(category: str, html: str, page_url: str, sessi
 
         card = anchor
         card_text = ""
-        for _ in range(6):
+        for _ in range(8):
             parent = card.parent
             if parent is None:
                 break
@@ -374,7 +414,7 @@ def parse_rakuten_cards_from_html(category: str, html: str, page_url: str, sessi
                 break
 
         rank = extract_rank_from_text(card_text)
-        if rank is None:
+        if rank is None or rank > 100:
             continue
 
         key = (rank, href)
@@ -383,13 +423,6 @@ def parse_rakuten_cards_from_html(category: str, html: str, page_url: str, sessi
         seen.add(key)
 
         price = extract_price_from_text(card_text)
-
-        # 店舗名は雑に拾う
-        store_name = ""
-        possible_lines = [clean_text(s) for s in card_text.split("レビュー")]
-        if possible_lines:
-            store_name = ""
-
         detail_title = fetch_detail_title(session, href, title)
         time.sleep(DETAIL_WAIT_SEC)
 
@@ -400,13 +433,12 @@ def parse_rakuten_cards_from_html(category: str, html: str, page_url: str, sessi
                 rank=rank,
                 listing_title=title,
                 detail_title=detail_title,
-                store_name=store_name,
+                store_name="",
                 price_value=price,
                 item_url=href,
             )
         )
 
-    # rank昇順・重複除去
     dedup: Dict[int, RankingItem] = {}
     for item in sorted(items, key=lambda x: x.rank):
         if item.rank not in dedup:
@@ -417,11 +449,16 @@ def parse_rakuten_cards_from_html(category: str, html: str, page_url: str, sessi
 
 def fetch_rakuten_rankings(category: str, urls: List[str], session: requests.Session) -> List[RankingItem]:
     all_items: List[RankingItem] = []
+
     for url in urls:
-        res = session.get(url, timeout=REQUEST_TIMEOUT)
-        res.raise_for_status()
-        items = parse_rakuten_cards_from_html(category, res.text, url, session)
-        all_items.extend(items)
+        try:
+            html = get_html_resilient(session, url, use_playwright_fallback=True)
+            items = parse_rakuten_cards_from_html(category, html, url, session)
+            print(f"[INFO] 楽天ページ取得成功: {url} / items={len(items)}")
+            all_items.extend(items)
+        except Exception as e:
+            print(f"[ERROR] 楽天ページ取得失敗のためスキップ: {url} / error={repr(e)}")
+            continue
 
     dedup_by_rank: Dict[int, RankingItem] = {}
     for item in sorted(all_items, key=lambda x: x.rank):
@@ -437,10 +474,9 @@ def fetch_yahoo_rankings(category: str, url: str, session: requests.Session) -> 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(user_agent=USER_AGENT, locale="ja-JP")
-        page.goto(url, wait_until="domcontentloaded", timeout=90000)
-        page.wait_for_timeout(4000)
+        page.goto(url, wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_timeout(5000)
 
-        # もっと見る を可能な限り押す
         for _ in range(20):
             if len(items) >= 100:
                 break
@@ -461,13 +497,11 @@ def fetch_yahoo_rankings(category: str, url: str, session: requests.Session) -> 
             if len(current) > len(items):
                 items = current
 
-        # 初回表示だけで十分なケースもある
         if not items:
             items = _extract_yahoo_items_from_page(page, category)
 
         browser.close()
 
-    # detail title を requests で補完
     enriched: List[RankingItem] = []
     for item in items[:100]:
         detail_title = fetch_detail_title(session, item.item_url, item.listing_title)
@@ -631,7 +665,6 @@ def append_rows_no_duplicate(path: Path, new_rows: List[Dict[str, str]]) -> bool
     else:
         combined = pd.concat([existing, new_df], ignore_index=True)
 
-    # 同日再実行時の重複防止
     combined["_dedup_key"] = (
         combined["モール"].astype(str) + "||" +
         combined["カテゴリ"].astype(str) + "||" +
@@ -640,7 +673,6 @@ def append_rows_no_duplicate(path: Path, new_rows: List[Dict[str, str]]) -> bool
     )
     combined = combined.drop_duplicates(subset=["_dedup_key"], keep="first").drop(columns=["_dedup_key"])
 
-    # 検索実行日 昇順で並べる
     combined["_sort_date"] = pd.to_datetime(combined["検索実行日"], format="%Y/%m/%d", errors="coerce")
     combined = combined.sort_values(
         by=["_sort_date", "モール", "カテゴリ", "商品名"],
@@ -685,7 +717,6 @@ def run(search_date_str: Optional[str] = None) -> int:
 
         masters = [m for m in masters_all if m.category == category]
 
-        # 楽天
         print(f"[INFO] 楽天収集中: {category}")
         rakuten_items = fetch_rakuten_rankings(category, config["rakuten_urls"], session)
         rakuten_rows = build_output_rows("楽天", category, masters, rakuten_items, search_date_value)
@@ -694,7 +725,6 @@ def run(search_date_str: Optional[str] = None) -> int:
         any_changed = any_changed or changed
         print(f"[INFO] 楽天 完了: items={len(rakuten_items)} file={rakuten_path.name} changed={changed}")
 
-        # Yahoo!
         print(f"[INFO] Yahoo!収集中: {category}")
         yahoo_items = fetch_yahoo_rankings(category, config["yahoo_url"], session)
         yahoo_rows = build_output_rows("Yahoo!", category, masters, yahoo_items, search_date_value)
