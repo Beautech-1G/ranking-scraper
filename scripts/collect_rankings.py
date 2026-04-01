@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -62,7 +61,13 @@ class ProductMaster:
     category: str
     product_name: str
     list_price: Optional[int]
+    maker_name_en: str
+    maker_name_ja: str
+    unique_key: str
     norm_name: str
+    norm_maker_en: str
+    norm_maker_ja: str
+    norm_unique_key: str
 
 
 @dataclass
@@ -96,8 +101,12 @@ def clean_text(text: str) -> str:
 
 def normalize_for_match(text: str) -> str:
     text = clean_text(text).lower()
-    text = text.replace("＋", "+").replace("／", "/").replace("＆", "&")
-    text = text.replace("　", " ")
+    text = (
+        text.replace("＋", "+")
+        .replace("／", "/")
+        .replace("＆", "&")
+        .replace("　", " ")
+    )
     text = re.sub(r"[ \t\r\n\-ー―‐_/\\.,，。・!！?？:：;；'\"“”‘’()\[\]【】『』<>＜＞|]+", "", text)
     return text
 
@@ -117,7 +126,7 @@ def load_master() -> List[ProductMaster]:
         raise FileNotFoundError(f"商品マスタCSVがありません: {MASTER_CSV}")
 
     df = pd.read_csv(MASTER_CSV, encoding="utf-8-sig")
-    required = {"カテゴリ", "商品名", "定価"}
+    required = {"カテゴリ", "商品名", "定価", "メーカー名①", "メーカー名②", "固有のキー"}
     if not required.issubset(df.columns):
         raise ValueError(f"商品マスタCSVの列が不足しています。必要列: {sorted(required)}")
 
@@ -126,14 +135,25 @@ def load_master() -> List[ProductMaster]:
         category = clean_text(str(row["カテゴリ"]))
         product_name = clean_text(str(row["商品名"]))
         list_price = parse_int_or_none(row["定価"])
+        maker_name_en = clean_text(str(row["メーカー名①"])) if not pd.isna(row["メーカー名①"]) else ""
+        maker_name_ja = clean_text(str(row["メーカー名②"])) if not pd.isna(row["メーカー名②"]) else ""
+        unique_key = clean_text(str(row["固有のキー"])) if not pd.isna(row["固有のキー"]) else ""
+
         if not category or not product_name:
             continue
+
         masters.append(
             ProductMaster(
                 category=category,
                 product_name=product_name,
                 list_price=list_price,
+                maker_name_en=maker_name_en,
+                maker_name_ja=maker_name_ja,
+                unique_key=unique_key,
                 norm_name=normalize_for_match(product_name),
+                norm_maker_en=normalize_for_match(maker_name_en),
+                norm_maker_ja=normalize_for_match(maker_name_ja),
+                norm_unique_key=normalize_for_match(unique_key),
             )
         )
     return masters
@@ -726,6 +746,169 @@ def _extract_yahoo_general_rows(page) -> List[Dict[str, object]]:
     return dedup_rows
 
 
+def _contains_token(target_text: str, token: str) -> bool:
+    if not token:
+        return False
+    return token in target_text
+
+
+def yahoo_match_score(master: ProductMaster, item: RankingItem) -> float:
+    combined = clean_text(f"{item.listing_title} {item.detail_title} {item.store_name}")
+    norm_combined = normalize_for_match(combined)
+
+    score = 0.0
+
+    name_score = max(
+        best_fuzzy_score(master.norm_name, normalize_for_match(item.listing_title)),
+        best_fuzzy_score(master.norm_name, normalize_for_match(item.detail_title)),
+        best_fuzzy_score(master.norm_name, norm_combined),
+    )
+    score += name_score * 0.35
+
+    maker_hit = False
+    if master.norm_maker_en and _contains_token(norm_combined, master.norm_maker_en):
+        maker_hit = True
+        score += 35
+    if master.norm_maker_ja and _contains_token(norm_combined, master.norm_maker_ja):
+        maker_hit = True
+        score += 35
+
+    key_hit = False
+    if master.norm_unique_key and _contains_token(norm_combined, master.norm_unique_key):
+        key_hit = True
+        score += 45
+
+    # ReFa系
+    if master.norm_maker_en == "refa" or master.norm_maker_ja == "リファ":
+        if "refa" in norm_combined or "リファ" in combined:
+            score += 20
+        if master.norm_unique_key == "u+":
+            if "u+" in norm_combined:
+                score += 50
+            if "u" in norm_combined and "u+" not in norm_combined:
+                score -= 35
+        elif master.norm_unique_key == "u":
+            if "u+" in norm_combined:
+                score -= 40
+            elif re.search(r"(finebubbleu)(?!\+)", norm_combined):
+                score += 45
+            elif "u" in norm_combined:
+                score += 15
+        elif master.norm_unique_key in {"veil", "pure", "150", "120", "90"}:
+            if master.norm_unique_key in norm_combined:
+                score += 55
+            else:
+                score -= 30
+
+    # MYTREX系
+    if master.norm_maker_en == "mytrex" or master.norm_maker_ja == "マイトレックス":
+        if "mytrex" in norm_combined or "マイトレックス" in combined:
+            score += 25
+        if "hihofinebubble" in norm_combined:
+            score += 20
+        if master.norm_unique_key == "+e":
+            if "+e" in norm_combined or "＋e" in combined:
+                score += 60
+            elif "+" in norm_combined or "＋" in combined:
+                score -= 25
+        elif master.norm_unique_key == "+":
+            if "+e" in norm_combined or "＋e" in combined:
+                score -= 35
+            elif "+" in norm_combined or "＋" in combined:
+                score += 45
+
+    # ミラブル系
+    if master.norm_maker_ja == "ミラブル":
+        if "ミラブル" in combined:
+            score += 25
+        if master.norm_unique_key in {"plus", "zero"}:
+            if master.norm_unique_key in norm_combined:
+                score += 60
+            else:
+                score -= 20
+        elif master.norm_unique_key in {"爽", "潤", "艶"}:
+            if master.norm_unique_key in combined:
+                score += 70
+            else:
+                score -= 25
+
+    # SALONIA / Panasonic / アイリス
+    if master.norm_maker_en == "salonia" or master.norm_maker_ja == "サロニア":
+        if "salonia" in norm_combined or "サロニア" in combined:
+            score += 35
+        if master.norm_unique_key and master.norm_unique_key in norm_combined:
+            score += 35
+
+    if master.norm_maker_en == "panasonic" or master.norm_maker_ja == "パナソニック":
+        if "panasonic" in norm_combined or "パナソニック" in combined:
+            score += 35
+        if master.norm_unique_key and master.norm_unique_key in norm_combined:
+            score += 45
+
+    if master.norm_maker_en == "micola" or master.norm_maker_ja == "アイリスオーヤマ":
+        if "micola" in norm_combined or "アイリスオーヤマ" in combined:
+            score += 35
+        if master.norm_unique_key and master.norm_unique_key in norm_combined:
+            score += 40
+
+    if not maker_hit and (master.norm_maker_en or master.norm_maker_ja):
+        score -= 20
+
+    if master.norm_unique_key and not key_hit and master.product_name != "各チャネルの1位":
+        score -= 10
+
+    return score
+
+
+def choose_top1_name_yahoo(top_item: Optional[RankingItem], masters: List[ProductMaster]) -> str:
+    if top_item is None:
+        return ""
+
+    target_masters = [m for m in masters if m.product_name != "各チャネルの1位"]
+
+    best_master: Optional[ProductMaster] = None
+    best_score = -9999.0
+    for master in target_masters:
+        score = yahoo_match_score(master, top_item)
+        if score > best_score:
+            best_score = score
+            best_master = master
+
+    if best_master and best_score >= 80:
+        return best_master.product_name
+
+    return derive_product_name_from_title(top_item.detail_title or top_item.listing_title)
+
+
+def pick_best_item_for_master_yahoo(master: ProductMaster, ranking_items: List[RankingItem]) -> Optional[RankingItem]:
+    scored: List[Tuple[RankingItem, float]] = []
+    for item in ranking_items:
+        score = yahoo_match_score(master, item)
+        scored.append((item, score))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda x: (-x[1], x[0].rank))
+
+    best_item, best_score = scored[0]
+
+    threshold = 85
+    if master.product_name == "各チャネルの1位":
+        threshold = 0
+    elif master.norm_maker_ja == "ミラブル":
+        threshold = 95
+    elif master.norm_maker_en == "refa":
+        threshold = 95
+    elif master.norm_maker_en == "mytrex":
+        threshold = 90
+
+    if best_score < threshold:
+        return None
+
+    return best_item
+
+
 def build_output_rows(
     mall: str,
     category: str,
@@ -737,7 +920,10 @@ def build_output_rows(
     rows: List[Dict[str, str]] = []
 
     top_item = ranking_items[0] if ranking_items else None
-    top1_name = choose_top1_name(top_item, masters)
+    if mall == "Yahoo!":
+        top1_name = choose_top1_name_yahoo(top_item, masters)
+    else:
+        top1_name = choose_top1_name(top_item, masters)
 
     for master in masters:
         if master.product_name == "各チャネルの1位":
@@ -762,7 +948,10 @@ def build_output_rows(
             )
             continue
 
-        best_item = pick_best_item_for_master(master, ranking_items)
+        if mall == "Yahoo!":
+            best_item = pick_best_item_for_master_yahoo(master, ranking_items)
+        else:
+            best_item = pick_best_item_for_master(master, ranking_items)
 
         rows.append(
             {
