@@ -1,0 +1,12 @@
+{
+  "targets": [
+    {
+      "mall": "Yahoo!",
+      "category": "シャワー",
+      "page_type": "yahoo_ranking",
+      "url": "https://shopping.yahoo.co.jp/categoryranking/46691/list",
+      "rank_start": 1,
+      "rank_end": 100
+    }
+  ]
+}
