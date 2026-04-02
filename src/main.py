@@ -349,10 +349,15 @@ def infer_product_name(title: str, maker_name: str = "") -> str:
     tokens = [t for t in cleaned.split(" ") if t]
 
     meaningful: List[str] = []
+
     if maker_name:
-        for token in tokens:
+        for i, token in enumerate(tokens):
             if maker_name.lower() in token.lower() or token.lower() in maker_name.lower():
                 meaningful.append(token)
+                if i + 1 < len(tokens):
+                    nxt = tokens[i + 1]
+                    if re.search(r"[A-Za-z0-9-]{2,}", nxt) or re.search(r"(zero|u|plus|pro|fbu|fbus)", nxt, flags=re.IGNORECASE):
+                        meaningful.append(nxt)
                 break
 
     stop_tokens = {
@@ -404,24 +409,6 @@ def parse_json_ld_objects(page: Page) -> List[dict]:
             continue
 
     return objects
-
-
-def extract_brand_from_jsonld(jsonlds: List[dict]) -> str:
-    for obj in jsonlds:
-        typ = str(obj.get("@type", "")).lower()
-        if "product" not in typ:
-            continue
-
-        brand = obj.get("brand")
-        if isinstance(brand, dict):
-            name = normalize_text(brand.get("name"))
-            if name:
-                return name
-        elif isinstance(brand, str):
-            brand = normalize_text(brand)
-            if brand:
-                return brand
-    return ""
 
 
 def extract_name_from_jsonld(jsonlds: List[dict]) -> str:
@@ -498,97 +485,208 @@ def build_row_key_from_csv_row(row: List[str]) -> Tuple[str, str, str, str, str]
 # =========================================================
 # Yahoo! 一覧ページの取得
 # =========================================================
-def auto_scroll_for_yahoo(page: Page, target_count: int = 100) -> None:
-    last_height = -1
-    stable_count = 0
+def click_more_if_visible(page: Page) -> bool:
+    selectors = [
+        "text=もっと見る",
+        "button:has-text('もっと見る')",
+        "a:has-text('もっと見る')",
+    ]
 
-    for i in range(30):
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if loc.count() > 0 and loc.is_visible():
+                loc.scroll_into_view_if_needed()
+                page.wait_for_timeout(500)
+                loc.click(timeout=3000)
+                page.wait_for_timeout(1500)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
+    last_count = 0
+    stable = 0
+
+    for i in range(40):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(SCROLL_WAIT_MS)
 
-        count = page.evaluate(
+        clicked = click_more_if_visible(page)
+        if clicked:
+            page.wait_for_timeout(1500)
+
+        rank_count = page.evaluate(
             """
             () => {
-              const links = Array.from(document.querySelectorAll('a[href*="-title"]'))
-                .map(a => a.href)
-                .filter(h => h.includes('store.shopping.yahoo.co.jp'));
-              return [...new Set(links)].length;
+              const all = Array.from(document.querySelectorAll('a[href*="-title"]'));
+              const headingCandidates = Array.from(document.querySelectorAll('*'));
+              const brandHeading = headingCandidates.find(el => {
+                const t = (el.textContent || '').trim();
+                return t === 'ブランド別 ランキング';
+              });
+
+              function isBeforeBrandSection(el) {
+                if (!brandHeading) return true;
+                const pos = el.compareDocumentPosition(brandHeading);
+                return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
+              }
+
+              function findCard(el) {
+                let node = el;
+                for (let i = 0; i < 8 && node; i++) {
+                  const text = (node.innerText || '').trim();
+                  if (/(^|\\n)\\s*(?:ランキング)?\\s*\\d+\\s*位(\\n|$)/.test(text)) {
+                    return node;
+                  }
+                  node = node.parentElement;
+                }
+                return el.parentElement || el;
+              }
+
+              const rankSet = new Set();
+
+              for (const a of all) {
+                const href = a.href || '';
+                if (!href.includes('store.shopping.yahoo.co.jp')) continue;
+                if (!href.includes('-title')) continue;
+                if (!isBeforeBrandSection(a)) continue;
+
+                const card = findCard(a);
+                const cardText = (card.innerText || '').trim();
+                const m = cardText.match(/(?:ランキング)?\\s*(\\d+)\\s*位/);
+                if (!m) continue;
+
+                rankSet.add(Number(m[1]));
+              }
+
+              return rankSet.size;
             }
             """
         )
-        height = page.evaluate("document.body.scrollHeight")
 
-        log(f"[INFO] Yahoo! スクロール {i + 1}回目 / title_link_count={count} / height={height}")
+        log(f"[INFO] Yahoo! 展開 {i + 1}回目 / detected_rank_count={rank_count} / clicked_more={clicked}")
 
-        if count >= target_count:
+        if rank_count >= target_rank:
             return
 
-        if height == last_height:
-            stable_count += 1
+        if rank_count == last_count and not clicked:
+            stable += 1
         else:
-            stable_count = 0
+            stable = 0
 
-        if stable_count >= 4:
+        if stable >= 4:
             return
 
-        last_height = height
+        last_count = rank_count
 
 
 def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List[RankingCandidate]:
-    auto_scroll_for_yahoo(page, target_count=rank_end)
+    auto_expand_yahoo(page, target_rank=rank_end)
 
     data = page.evaluate(
         """
         () => {
           const anchors = Array.from(document.querySelectorAll('a[href*="-title"]'));
-          const rows = [];
-          const seen = new Set();
+          const headingCandidates = Array.from(document.querySelectorAll('*'));
+          const brandHeading = headingCandidates.find(el => {
+            const t = (el.textContent || '').trim();
+            return t === 'ブランド別 ランキング';
+          });
 
-          const looksLikeProductUrl = (href) => {
-            if (!href) return false;
-            if (!href.includes('store.shopping.yahoo.co.jp')) return false;
-            if (!href.includes('-title')) return false;
-            return true;
-          };
+          function isBeforeBrandSection(el) {
+            if (!brandHeading) return true;
+            const pos = el.compareDocumentPosition(brandHeading);
+            return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
+          }
 
-          const collectTexts = (el) => {
-            const texts = [];
+          function findCard(el) {
             let node = el;
-            for (let i = 0; i < 8 && node; i++) {
+            for (let i = 0; i < 10 && node; i++) {
               const text = (node.innerText || '').trim();
-              if (text) texts.push(text);
+              if (/(^|\\n)\\s*(?:ランキング)?\\s*\\d+\\s*位(\\n|$)/.test(text)) {
+                return node;
+              }
               node = node.parentElement;
             }
-            return texts.join('\\n');
-          };
+            return el.parentElement || el;
+          }
+
+          function getMakerText(card, titleAnchor) {
+            const cardAnchors = Array.from(card.querySelectorAll('a'));
+            const preceding = cardAnchors.filter(a => {
+              if (a === titleAnchor) return false;
+              const text = (a.textContent || '').trim();
+              if (!text) return false;
+
+              const pos = a.compareDocumentPosition(titleAnchor);
+              return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
+            });
+
+            const cleaned = preceding
+              .map(a => (a.textContent || '').trim())
+              .filter(t =>
+                t &&
+                !/^最安値を見る$/.test(t) &&
+                !/件/.test(t) &&
+                !/ランキング/.test(t) &&
+                !/OFF/.test(t) &&
+                !/円/.test(t) &&
+                !/ショップ$/.test(t) &&
+                !/店$/.test(t)
+              );
+
+            if (cleaned.length === 0) return '';
+            return cleaned[cleaned.length - 1];
+          }
+
+          const rows = [];
+          const rankSeen = new Set();
 
           for (const a of anchors) {
             const href = a.href || '';
-            if (!looksLikeProductUrl(href)) continue;
-            if (seen.has(href)) continue;
-            seen.add(href);
+            if (!href.includes('store.shopping.yahoo.co.jp')) continue;
+            if (!href.includes('-title')) continue;
+            if (!isBeforeBrandSection(a)) continue;
 
-            const title = (a.innerText || a.getAttribute('title') || '').trim();
-            const text = collectTexts(a);
+            const card = findCard(a);
+            const cardText = (card.innerText || '').trim();
+
+            const m = cardText.match(/(?:ランキング)?\\s*(\\d+)\\s*位/);
+            if (!m) continue;
+
+            const rank = Number(m[1]);
+            if (!Number.isFinite(rank)) continue;
+            if (rankSeen.has(rank)) continue;
+
+            const title = ((a.textContent || '').trim() || (a.getAttribute('title') || '').trim());
+            const maker = getMakerText(card, a);
 
             rows.push({
+              ranking: rank,
               url: href,
               title: title,
-              nearbyText: text
+              nearbyText: cardText,
+              maker: maker
             });
+
+            rankSeen.add(rank);
           }
 
+          rows.sort((a, b) => a.ranking - b.ranking);
           return rows;
         }
         """
     )
 
     candidates: List[RankingCandidate] = []
-    current_rank = rank_start
 
     for item in data:
-        if current_rank > rank_end:
-            break
+        ranking = int(item.get("ranking", 0))
+        if ranking < rank_start or ranking > rank_end:
+            continue
 
         url = clean_url(item.get("url", ""))
         if not url:
@@ -596,6 +694,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
 
         nearby = normalize_text(item.get("nearbyText", ""))
         title = normalize_text(item.get("title", ""))
+        maker = normalize_text(item.get("maker", ""))
 
         direct_discount_text = extract_direct_discount_text(nearby)
         coupon_text = ""
@@ -604,17 +703,17 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
 
         candidates.append(
             RankingCandidate(
-                ranking=current_rank,
+                ranking=ranking,
                 detail_url=url,
                 list_title=title,
                 list_price_text=extract_first_int_price(nearby),
                 list_direct_discount_text=direct_discount_text,
                 list_coupon_text=coupon_text,
-                list_maker_text="",
+                list_maker_text=maker,
             )
         )
-        current_rank += 1
 
+    candidates.sort(key=lambda x: x.ranking)
     return candidates
 
 
@@ -651,31 +750,6 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
         og_title,
         title_text,
         candidate.list_title,
-    )
-
-    maker_name = ""
-    maker_selectors = [
-        '[itemprop="brand"]',
-        '.brand',
-        '.maker',
-        '.manufacturer',
-        'a[href*="brand"]',
-        'a[href*="maker"]',
-    ]
-    for selector in maker_selectors:
-        try:
-            loc = page.locator(selector).first
-            if loc.count() > 0:
-                maker_name = normalize_text(loc.inner_text())
-                if maker_name:
-                    break
-        except Exception:
-            continue
-
-    maker_name = choose_first_non_empty(
-        maker_name,
-        extract_brand_from_jsonld(jsonlds),
-        candidate.list_maker_text,
     )
 
     body_text = ""
@@ -736,6 +810,10 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
     )
 
     detail_url = page.url
+
+    # メーカー名は一覧上の青文字のみ採用
+    maker_name = candidate.list_maker_text
+
     product_name = infer_product_name(product_title, maker_name)
 
     return DetailInfo(
