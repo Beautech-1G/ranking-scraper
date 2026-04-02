@@ -1,0 +1,28 @@
+{
+  "targets": [
+    {
+      "mall": "楽天",
+      "category": "シャワー",
+      "page_type": "rakuten_ranking",
+      "url": "https://ranking.rakuten.co.jp/weekly/508456/",
+      "rank_start": 1,
+      "rank_end": 80
+    },
+    {
+      "mall": "楽天",
+      "category": "シャワー",
+      "page_type": "rakuten_ranking",
+      "url": "https://ranking.rakuten.co.jp/weekly/508456/p=2/",
+      "rank_start": 81,
+      "rank_end": 100
+    },
+    {
+      "mall": "Yahoo!",
+      "category": "シャワー",
+      "page_type": "yahoo_ranking",
+      "url": "https://shopping.yahoo.co.jp/categoryranking/46691/list",
+      "rank_start": 1,
+      "rank_end": 100
+    }
+  ]
+}
