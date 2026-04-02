@@ -235,6 +235,19 @@ def clean_url(url: str) -> str:
     return normalize_text(url)
 
 
+def normalize_yahoo_product_url(url: str) -> str:
+    url = clean_url(url)
+    if not url:
+        return ""
+
+    # -img を -title に寄せる
+    url = re.sub(r"(?<=shopping[^ ]*)(-img)(?=(&|$))", "-title", url)
+    url = re.sub(r"(?<=shopping[^ ]*)(-image)(?=(&|$))", "-title", url)
+    url = url.replace("-img", "-title")
+    url = url.replace("-image", "-title")
+    return url
+
+
 def extract_first_int_price(text: str) -> str:
     text = normalize_text(text)
     m = re.search(r"([0-9][0-9,]*)\s*円", text)
@@ -507,6 +520,7 @@ def click_more_if_visible(page: Page) -> bool:
         "text=もっと見る",
         "button:has-text('もっと見る')",
         "a:has-text('もっと見る')",
+        '[aria-label*="もっと見る"]',
     ]
 
     for selector in selectors:
@@ -527,7 +541,7 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
     last_count = 0
     stable = 0
 
-    for i in range(40):
+    for i in range(60):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(SCROLL_WAIT_MS)
 
@@ -538,7 +552,6 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
         count = page.evaluate(
             """
             () => {
-              const anchors = Array.from(document.querySelectorAll('a[href*="-title"]'));
               const headingCandidates = Array.from(document.querySelectorAll('*'));
               const brandHeading = headingCandidates.find(el => {
                 const t = (el.textContent || '').trim();
@@ -551,14 +564,26 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
                 return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
               }
 
+              function normalizeUrl(href) {
+                if (!href) return '';
+                let u = href;
+                u = u.replace('-img', '-title');
+                u = u.replace('-image', '-title');
+                return u;
+              }
+
+              const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
               const urlSet = new Set();
 
               for (const a of anchors) {
                 const href = a.href || '';
                 if (!href.includes('store.shopping.yahoo.co.jp')) continue;
-                if (!href.includes('-title')) continue;
                 if (!isBeforeBrandSection(a)) continue;
-                urlSet.add(href);
+
+                const normalized = normalizeUrl(href);
+                if (!normalized.includes('-title')) continue;
+
+                urlSet.add(normalized);
               }
 
               return urlSet.size;
@@ -576,7 +601,7 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
         else:
             stable = 0
 
-        if stable >= 4:
+        if stable >= 5:
             return
 
         last_count = count
@@ -588,7 +613,6 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
     data = page.evaluate(
         """
         () => {
-          const anchors = Array.from(document.querySelectorAll('a[href*="-title"]'));
           const headingCandidates = Array.from(document.querySelectorAll('*'));
           const brandHeading = headingCandidates.find(el => {
             const t = (el.textContent || '').trim();
@@ -601,14 +625,40 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
           }
 
+          function normalizeUrl(href) {
+            if (!href) return '';
+            let u = href;
+            u = u.replace('-img', '-title');
+            u = u.replace('-image', '-title');
+            return u;
+          }
+
           function findCard(el) {
             let node = el;
-            for (let i = 0; i < 10 && node; i++) {
+            let best = el.parentElement || el;
+
+            for (let i = 0; i < 12 && node; i++) {
               const text = (node.innerText || '').trim();
-              if (text) return node;
+              const anchorCount = node.querySelectorAll ? node.querySelectorAll('a').length : 0;
+
+              if (
+                text &&
+                (
+                  /円/.test(text) ||
+                  /ランキング/.test(text) ||
+                  /PR/.test(text) ||
+                  /件/.test(text) ||
+                  /OFF/.test(text)
+                ) &&
+                anchorCount >= 2
+              ) {
+                best = node;
+              }
+
               node = node.parentElement;
             }
-            return el.parentElement || el;
+
+            return best;
           }
 
           function getMakerText(card, titleAnchor) {
@@ -633,22 +683,26 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
                 !/円/.test(t) &&
                 !/ショップ$/.test(t) &&
                 !/店$/.test(t) &&
-                t !== 'PR'
+                t !== 'PR' &&
+                t !== '詳細'
               );
 
             if (cleaned.length === 0) return '';
             return cleaned[cleaned.length - 1];
           }
 
+          const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
           const rows = [];
           const urlSeen = new Set();
 
           for (const a of anchors) {
             const href = a.href || '';
             if (!href.includes('store.shopping.yahoo.co.jp')) continue;
-            if (!href.includes('-title')) continue;
             if (!isBeforeBrandSection(a)) continue;
-            if (urlSeen.has(href)) continue;
+
+            const normalized = normalizeUrl(href);
+            if (!normalized.includes('-title')) continue;
+            if (urlSeen.has(normalized)) continue;
 
             const card = findCard(a);
             const cardText = (card.innerText || '').trim();
@@ -656,13 +710,13 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             const maker = getMakerText(card, a);
 
             rows.push({
-              url: href,
+              url: normalized,
               title: title,
               nearbyText: cardText,
               maker: maker
             });
 
-            urlSeen.add(href);
+            urlSeen.add(normalized);
           }
 
           return rows;
@@ -673,7 +727,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
     candidates: List[RankingCandidate] = []
 
     for item in data:
-        url = clean_url(item.get("url", ""))
+        url = normalize_yahoo_product_url(item.get("url", ""))
         if not url:
             continue
 
