@@ -240,9 +240,7 @@ def normalize_yahoo_product_url(url: str) -> str:
     if not url:
         return ""
 
-    # -img を -title に寄せる
-    url = re.sub(r"(?<=shopping[^ ]*)(-img)(?=(&|$))", "-title", url)
-    url = re.sub(r"(?<=shopping[^ ]*)(-image)(?=(&|$))", "-title", url)
+    # -img / -image を -title に寄せる
     url = url.replace("-img", "-title")
     url = url.replace("-image", "-title")
     return url
