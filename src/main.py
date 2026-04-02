@@ -11,8 +11,7 @@ import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from typing import List, Optional, Set, Tuple
 
 from zoneinfo import ZoneInfo
 
@@ -29,21 +28,21 @@ CONFIG_PATH = BASE_DIR / "config" / "targets.json"
 DATA_DIR = BASE_DIR / "data"
 
 CSV_HEADERS = [
-    "開始日",       # A
-    "終了日",       # B
-    "期間",         # C
-    "配信日",       # D
-    "年月",         # E
-    "検索実行日",   # F
-    "モール",       # G
-    "ランキング",   # H
-    "カテゴリ",     # I
-    "メーカー名",   # J
-    "商品名",       # K
-    "商品タイトル", # L
-    "販売価格",     # M
-    "値引き情報",   # N
-    "商品ページURL" # O
+    "開始日",
+    "終了日",
+    "期間",
+    "配信日",
+    "年月",
+    "検索実行日",
+    "モール",
+    "ランキング",
+    "カテゴリ",
+    "メーカー名",
+    "商品名",
+    "商品タイトル",
+    "販売価格",
+    "値引き情報",
+    "商品ページURL",
 ]
 
 USER_AGENT = (
@@ -78,7 +77,8 @@ class RankingCandidate:
     detail_url: str
     list_title: str = ""
     list_price_text: str = ""
-    list_discount_text: str = ""
+    list_direct_discount_text: str = ""
+    list_coupon_text: str = ""
     list_maker_text: str = ""
 
 
@@ -117,8 +117,6 @@ def ensure_data_dir() -> None:
 
 
 def get_jst_now() -> datetime:
-    # 手動テスト用:
-    # GitHub Actionsのworkflow_dispatchで RUN_DATE=2026-04-02 を渡せばその日付で動作
     forced = os.getenv("RUN_DATE", "").strip()
     if forced:
         try:
@@ -186,13 +184,6 @@ def ensure_csv_exists(csv_path: Path) -> None:
 
 
 def read_same_day_keys(csv_path: Path, run_date_str: str) -> Set[Tuple[str, str, str, str, str]]:
-    """
-    重複判定キー:
-    検索実行日 + モール + カテゴリ + ランキング + 商品ページURL
-
-    同じ木曜の9時と12時の重複判定用として、
-    当日分のみ読み込む。
-    """
     keys: Set[Tuple[str, str, str, str, str]] = set()
 
     if not csv_path.exists():
@@ -243,17 +234,7 @@ def clean_url(url: str) -> str:
     return normalize_text(url)
 
 
-def hostname_of(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower()
-    except Exception:
-        return ""
-
-
 def extract_first_int_price(text: str) -> str:
-    """
-    3,980円 -> 3980
-    """
     text = normalize_text(text)
     m = re.search(r"([0-9][0-9,]*)\s*円", text)
     if m:
@@ -264,28 +245,72 @@ def extract_first_int_price(text: str) -> str:
     return ""
 
 
-def find_discount_text(text: str) -> str:
-    text = normalize_text(text)
-    patterns = [
-        r"([0-9]{1,3}\s*%OFF)",
-        r"([0-9]{1,3}\s*％OFF)",
-        r"([0-9]{1,3}\s*%OFF価格)",
-        r"([0-9]{1,3}\s*％OFF価格)",
-        r"([0-9]{1,3}\s*%オフ)",
-        r"([0-9]{1,3}\s*％オフ)",
-    ]
-    for p in patterns:
-        m = re.search(p, text, flags=re.IGNORECASE)
-        if m:
-            return normalize_text(m.group(1))
-    return ""
-
-
 def choose_first_non_empty(*values: str) -> str:
     for v in values:
         v = normalize_text(v)
         if v:
             return v
+    return ""
+
+
+def normalize_percent_text(text: str) -> str:
+    text = normalize_text(text)
+    text = text.replace("%", "％")
+    return text
+
+
+def extract_direct_discount_text(text: str) -> str:
+    text = normalize_text(text)
+
+    patterns = [
+        r"([0-9]{1,3}\s*[%％]\s*OFF価格)",
+        r"([0-9]{1,3}\s*[%％]\s*OFF)",
+        r"([0-9]{1,3}\s*[%％]\s*オフ)",
+    ]
+
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            value = normalize_percent_text(m.group(1))
+            value = re.sub(r"\s+", "", value)
+            value = value.replace("％OFF価格", "％OFF")
+            return value
+
+    return ""
+
+
+def extract_coupon_text(text: str) -> str:
+    text = normalize_text(text)
+
+    m_coupon = re.search(r"([0-9]{1,3}\s*[%％]\s*OFFクーポン)", text, flags=re.IGNORECASE)
+    if not m_coupon:
+        m_coupon = re.search(r"([0-9]{1,3}\s*[%％]\s*オフクーポン)", text, flags=re.IGNORECASE)
+
+    if not m_coupon:
+        return ""
+
+    coupon = normalize_percent_text(m_coupon.group(1))
+    coupon = re.sub(r"\s+", "", coupon)
+    coupon = coupon.replace("％オフクーポン", "％OFFクーポン")
+
+    m_limit = re.search(r"(値引き上限\s*[0-9,]+円)", text)
+    if not m_limit:
+        m_limit = re.search(r"(上限\s*[0-9,]+円)", text)
+
+    if m_limit:
+        limit_text = normalize_text(m_limit.group(1))
+        return f"{coupon} {limit_text}"
+
+    return coupon
+
+
+def choose_discount_text(direct_discount_text: str, coupon_text: str) -> str:
+    direct_discount_text = normalize_text(direct_discount_text)
+    coupon_text = normalize_text(coupon_text)
+    if direct_discount_text:
+        return direct_discount_text
+    if coupon_text:
+        return coupon_text
     return ""
 
 
@@ -302,14 +327,6 @@ def remove_brackets_prefix(text: str) -> str:
 
 
 def infer_product_name(title: str, maker_name: str = "") -> str:
-    """
-    簡易ルールベース:
-    - 先頭の装飾を除去
-    - メーカー名が先頭に近ければ残す
-    - 汎用語・販促語を落とす
-    - 2〜4トークン程度を返す
-    - うまく推定できない場合はタイトル先頭を短く返す
-    """
     title = remove_brackets_prefix(title)
     title = normalize_text(title)
 
@@ -470,29 +487,29 @@ def build_csv_row(
 
 def build_row_key_from_csv_row(row: List[str]) -> Tuple[str, str, str, str, str]:
     return (
-        normalize_text(row[5]),   # 検索実行日
-        normalize_text(row[6]),   # モール
-        normalize_text(row[8]),   # カテゴリ
-        normalize_text(row[7]),   # ランキング
-        normalize_text(row[14]),  # 商品ページURL
+        normalize_text(row[5]),
+        normalize_text(row[6]),
+        normalize_text(row[8]),
+        normalize_text(row[7]),
+        normalize_text(row[14]),
     )
 
 
 # =========================================================
-# 一覧ページの取得
+# Yahoo! 一覧ページの取得
 # =========================================================
 def auto_scroll_for_yahoo(page: Page, target_count: int = 100) -> None:
     last_height = -1
     stable_count = 0
 
-    for i in range(20):
+    for i in range(30):
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         page.wait_for_timeout(SCROLL_WAIT_MS)
 
         count = page.evaluate(
             """
             () => {
-              const links = Array.from(document.querySelectorAll('a[href]'))
+              const links = Array.from(document.querySelectorAll('a[href*="-title"]'))
                 .map(a => a.href)
                 .filter(h => h.includes('store.shopping.yahoo.co.jp'));
               return [...new Set(links)].length;
@@ -501,7 +518,7 @@ def auto_scroll_for_yahoo(page: Page, target_count: int = 100) -> None:
         )
         height = page.evaluate("document.body.scrollHeight")
 
-        log(f"[INFO] Yahoo! スクロール {i + 1}回目 / link_count={count} / height={height}")
+        log(f"[INFO] Yahoo! スクロール {i + 1}回目 / title_link_count={count} / height={height}")
 
         if count >= target_count:
             return
@@ -511,7 +528,7 @@ def auto_scroll_for_yahoo(page: Page, target_count: int = 100) -> None:
         else:
             stable_count = 0
 
-        if stable_count >= 3:
+        if stable_count >= 4:
             return
 
         last_height = height
@@ -523,23 +540,26 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
     data = page.evaluate(
         """
         () => {
-          const anchors = Array.from(document.querySelectorAll('a[href]'));
+          const anchors = Array.from(document.querySelectorAll('a[href*="-title"]'));
           const rows = [];
           const seen = new Set();
 
           const looksLikeProductUrl = (href) => {
             if (!href) return false;
-            return href.includes('store.shopping.yahoo.co.jp');
+            if (!href.includes('store.shopping.yahoo.co.jp')) return false;
+            if (!href.includes('-title')) return false;
+            return true;
           };
 
-          const getNearestText = (el) => {
+          const collectTexts = (el) => {
+            const texts = [];
             let node = el;
-            for (let i = 0; i < 5 && node; i++) {
+            for (let i = 0; i < 8 && node; i++) {
               const text = (node.innerText || '').trim();
-              if (text) return text;
+              if (text) texts.push(text);
               node = node.parentElement;
             }
-            return '';
+            return texts.join('\\n');
           };
 
           for (const a of anchors) {
@@ -549,7 +569,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             seen.add(href);
 
             const title = (a.innerText || a.getAttribute('title') || '').trim();
-            const text = getNearestText(a);
+            const text = collectTexts(a);
 
             rows.push({
               url: href,
@@ -577,78 +597,10 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
         nearby = normalize_text(item.get("nearbyText", ""))
         title = normalize_text(item.get("title", ""))
 
-        candidates.append(
-            RankingCandidate(
-                ranking=current_rank,
-                detail_url=url,
-                list_title=title,
-                list_price_text=extract_first_int_price(nearby),
-                list_discount_text=find_discount_text(nearby),
-                list_maker_text="",
-            )
-        )
-        current_rank += 1
-
-    return candidates
-
-
-def extract_rakuten_candidates(page: Page, rank_start: int, rank_end: int) -> List[RankingCandidate]:
-    data = page.evaluate(
-        """
-        () => {
-          const anchors = Array.from(document.querySelectorAll('a[href]'));
-          const rows = [];
-          const seen = new Set();
-
-          const looksLikeProductUrl = (href) => {
-            if (!href) return false;
-            return href.includes('item.rakuten.co.jp');
-          };
-
-          const getNearestText = (el) => {
-            let node = el;
-            for (let i = 0; i < 6 && node; i++) {
-              const text = (node.innerText || '').trim();
-              if (text) return text;
-              node = node.parentElement;
-            }
-            return '';
-          };
-
-          for (const a of anchors) {
-            const href = a.href || '';
-            if (!looksLikeProductUrl(href)) continue;
-            if (seen.has(href)) continue;
-            seen.add(href);
-
-            const title = (a.innerText || a.getAttribute('title') || '').trim();
-            const text = getNearestText(a);
-
-            rows.push({
-              url: href,
-              title: title,
-              nearbyText: text
-            });
-          }
-
-          return rows;
-        }
-        """
-    )
-
-    candidates: List[RankingCandidate] = []
-    current_rank = rank_start
-
-    for item in data:
-        if current_rank > rank_end:
-            break
-
-        url = clean_url(item.get("url", ""))
-        if not url:
-            continue
-
-        nearby = normalize_text(item.get("nearbyText", ""))
-        title = normalize_text(item.get("title", ""))
+        direct_discount_text = extract_direct_discount_text(nearby)
+        coupon_text = ""
+        if not direct_discount_text:
+            coupon_text = extract_coupon_text(nearby)
 
         candidates.append(
             RankingCandidate(
@@ -656,7 +608,8 @@ def extract_rakuten_candidates(page: Page, rank_start: int, rank_end: int) -> Li
                 detail_url=url,
                 list_title=title,
                 list_price_text=extract_first_int_price(nearby),
-                list_discount_text=find_discount_text(nearby),
+                list_direct_discount_text=direct_discount_text,
+                list_coupon_text=coupon_text,
                 list_maker_text="",
             )
         )
@@ -673,7 +626,6 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
 
     page.wait_for_timeout(1500)
     title_text = normalize_text(page.title())
-
     jsonlds = parse_json_ld_objects(page)
 
     og_title = ""
@@ -732,7 +684,6 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
     except Exception:
         body_text = ""
 
-    price = ""
     meta_price = ""
     for selector, attr in [
         ('meta[property="product:price:amount"]', "content"),
@@ -774,13 +725,17 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
         candidate.list_price_text,
     )
 
-    discount_text = choose_first_non_empty(
-        find_discount_text(body_text),
-        candidate.list_discount_text,
+    direct_discount_text = extract_direct_discount_text(body_text)
+    coupon_text = ""
+    if not direct_discount_text:
+        coupon_text = extract_coupon_text(body_text)
+
+    discount_text = choose_discount_text(
+        direct_discount_text or candidate.list_direct_discount_text,
+        coupon_text or candidate.list_coupon_text,
     )
 
     detail_url = page.url
-
     product_name = infer_product_name(product_title, maker_name)
 
     return DetailInfo(
@@ -794,7 +749,7 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
 
 
 # =========================================================
-# モール別収集
+# 収集処理
 # =========================================================
 def collect_target_rows(context: BrowserContext, target: Target, run_dt: datetime) -> List[List[str]]:
     log(f"[INFO] 収集開始: mall={target.mall} / category={target.category} / url={target.url}")
@@ -802,13 +757,10 @@ def collect_target_rows(context: BrowserContext, target: Target, run_dt: datetim
     page = context.new_page()
     safe_goto(page, target.url, f"list_{target.mall}_{target.category}")
 
-    if target.page_type == "yahoo_ranking":
-        candidates = extract_yahoo_candidates(page, target.rank_start, target.rank_end)
-    elif target.page_type == "rakuten_ranking":
-        candidates = extract_rakuten_candidates(page, target.rank_start, target.rank_end)
-    else:
+    if target.page_type != "yahoo_ranking":
         raise ValueError(f"未対応の page_type: {target.page_type}")
 
+    candidates = extract_yahoo_candidates(page, target.rank_start, target.rank_end)
     page.close()
 
     log(
@@ -873,7 +825,6 @@ def create_browser_context(playwright: Playwright) -> Tuple[Browser, BrowserCont
         viewport={"width": 1400, "height": 1800},
     )
 
-    # 軽めのステルス寄せ
     context.add_init_script(
         """
         Object.defineProperty(navigator, 'webdriver', {
@@ -932,7 +883,6 @@ def main() -> int:
         same_day_keys.add(key)
         new_rows.append(row)
 
-    # 同日分の再実行でも昇順は維持される
     new_rows.sort(key=lambda r: (r[5], r[6], r[8], int(r[7])))
 
     log(f"[INFO] 新規追記件数: {len(new_rows)}")
