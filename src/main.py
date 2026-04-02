@@ -73,8 +73,8 @@ class Target:
 
 @dataclass
 class RankingCandidate:
-    ranking: int
-    detail_url: str
+    ranking: int = 0
+    detail_url: str = ""
     list_title: str = ""
     list_price_text: str = ""
     list_direct_discount_text: str = ""
@@ -84,6 +84,7 @@ class RankingCandidate:
 
 @dataclass
 class DetailInfo:
+    ranking: int
     maker_name: str
     product_name: str
     product_title: str
@@ -441,10 +442,26 @@ def extract_price_from_jsonld(jsonlds: List[dict]) -> str:
     return ""
 
 
+def extract_ranking_from_text(text: str) -> int:
+    text = normalize_text(text)
+
+    patterns = [
+        r"ランキング\s*([0-9]{1,3})\s*位",
+        r"([0-9]{1,3})\s*位",
+    ]
+    for p in patterns:
+        m = re.search(p, text)
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                pass
+    return 0
+
+
 def build_csv_row(
     run_dt: datetime,
     mall: str,
-    ranking: int,
     category: str,
     detail: DetailInfo,
 ) -> List[str]:
@@ -461,7 +478,7 @@ def build_csv_row(
         format_year_month(delivery_date),
         format_ymd_slash(run_date),
         mall,
-        str(ranking),
+        str(detail.ranking),
         category,
         detail.maker_name,
         detail.product_name,
@@ -518,10 +535,10 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
         if clicked:
             page.wait_for_timeout(1500)
 
-        rank_count = page.evaluate(
+        count = page.evaluate(
             """
             () => {
-              const all = Array.from(document.querySelectorAll('a[href*="-title"]'));
+              const anchors = Array.from(document.querySelectorAll('a[href*="-title"]'));
               const headingCandidates = Array.from(document.querySelectorAll('*'));
               const brandHeading = headingCandidates.find(el => {
                 const t = (el.textContent || '').trim();
@@ -534,45 +551,27 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
                 return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
               }
 
-              function findCard(el) {
-                let node = el;
-                for (let i = 0; i < 8 && node; i++) {
-                  const text = (node.innerText || '').trim();
-                  if (/(^|\\n)\\s*(?:ランキング)?\\s*\\d+\\s*位(\\n|$)/.test(text)) {
-                    return node;
-                  }
-                  node = node.parentElement;
-                }
-                return el.parentElement || el;
-              }
+              const urlSet = new Set();
 
-              const rankSet = new Set();
-
-              for (const a of all) {
+              for (const a of anchors) {
                 const href = a.href || '';
                 if (!href.includes('store.shopping.yahoo.co.jp')) continue;
                 if (!href.includes('-title')) continue;
                 if (!isBeforeBrandSection(a)) continue;
-
-                const card = findCard(a);
-                const cardText = (card.innerText || '').trim();
-                const m = cardText.match(/(?:ランキング)?\\s*(\\d+)\\s*位/);
-                if (!m) continue;
-
-                rankSet.add(Number(m[1]));
+                urlSet.add(href);
               }
 
-              return rankSet.size;
+              return urlSet.size;
             }
             """
         )
 
-        log(f"[INFO] Yahoo! 展開 {i + 1}回目 / detected_rank_count={rank_count} / clicked_more={clicked}")
+        log(f"[INFO] Yahoo! 展開 {i + 1}回目 / detected_url_count={count} / clicked_more={clicked}")
 
-        if rank_count >= target_rank:
+        if count >= target_rank:
             return
 
-        if rank_count == last_count and not clicked:
+        if count == last_count and not clicked:
             stable += 1
         else:
             stable = 0
@@ -580,7 +579,7 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
         if stable >= 4:
             return
 
-        last_count = rank_count
+        last_count = count
 
 
 def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List[RankingCandidate]:
@@ -606,9 +605,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             let node = el;
             for (let i = 0; i < 10 && node; i++) {
               const text = (node.innerText || '').trim();
-              if (/(^|\\n)\\s*(?:ランキング)?\\s*\\d+\\s*位(\\n|$)/.test(text)) {
-                return node;
-              }
+              if (text) return node;
               node = node.parentElement;
             }
             return el.parentElement || el;
@@ -635,7 +632,8 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
                 !/OFF/.test(t) &&
                 !/円/.test(t) &&
                 !/ショップ$/.test(t) &&
-                !/店$/.test(t)
+                !/店$/.test(t) &&
+                t !== 'PR'
               );
 
             if (cleaned.length === 0) return '';
@@ -643,39 +641,30 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
           }
 
           const rows = [];
-          const rankSeen = new Set();
+          const urlSeen = new Set();
 
           for (const a of anchors) {
             const href = a.href || '';
             if (!href.includes('store.shopping.yahoo.co.jp')) continue;
             if (!href.includes('-title')) continue;
             if (!isBeforeBrandSection(a)) continue;
+            if (urlSeen.has(href)) continue;
 
             const card = findCard(a);
             const cardText = (card.innerText || '').trim();
-
-            const m = cardText.match(/(?:ランキング)?\\s*(\\d+)\\s*位/);
-            if (!m) continue;
-
-            const rank = Number(m[1]);
-            if (!Number.isFinite(rank)) continue;
-            if (rankSeen.has(rank)) continue;
-
             const title = ((a.textContent || '').trim() || (a.getAttribute('title') || '').trim());
             const maker = getMakerText(card, a);
 
             rows.push({
-              ranking: rank,
               url: href,
               title: title,
               nearbyText: cardText,
               maker: maker
             });
 
-            rankSeen.add(rank);
+            urlSeen.add(href);
           }
 
-          rows.sort((a, b) => a.ranking - b.ranking);
           return rows;
         }
         """
@@ -684,10 +673,6 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
     candidates: List[RankingCandidate] = []
 
     for item in data:
-        ranking = int(item.get("ranking", 0))
-        if ranking < rank_start or ranking > rank_end:
-            continue
-
         url = clean_url(item.get("url", ""))
         if not url:
             continue
@@ -703,7 +688,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
 
         candidates.append(
             RankingCandidate(
-                ranking=ranking,
+                ranking=0,
                 detail_url=url,
                 list_title=title,
                 list_price_text=extract_first_int_price(nearby),
@@ -713,7 +698,6 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             )
         )
 
-    candidates.sort(key=lambda x: x.ranking)
     return candidates
 
 
@@ -721,7 +705,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
 # 詳細ページの取得
 # =========================================================
 def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> DetailInfo:
-    safe_goto(page, candidate.detail_url, f"detail_{mall}_{candidate.ranking}")
+    safe_goto(page, candidate.detail_url, f"detail_{mall}")
 
     page.wait_for_timeout(1500)
     title_text = normalize_text(page.title())
@@ -757,6 +741,8 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
         body_text = normalize_text(page.locator("body").inner_text())
     except Exception:
         body_text = ""
+
+    ranking = extract_ranking_from_text(body_text)
 
     meta_price = ""
     for selector, attr in [
@@ -810,13 +796,11 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
     )
 
     detail_url = page.url
-
-    # メーカー名は一覧上の青文字のみ採用
     maker_name = candidate.list_maker_text
-
     product_name = infer_product_name(product_title, maker_name)
 
     return DetailInfo(
+        ranking=ranking,
         maker_name=maker_name,
         product_name=product_name,
         product_title=product_title,
@@ -841,45 +825,64 @@ def collect_target_rows(context: BrowserContext, target: Target, run_dt: datetim
     candidates = extract_yahoo_candidates(page, target.rank_start, target.rank_end)
     page.close()
 
-    log(
-        f"[INFO] 一覧抽出件数: mall={target.mall} / category={target.category} / "
-        f"expected={target.rank_end - target.rank_start + 1} / got={len(candidates)}"
-    )
+    log(f"[INFO] 一覧URL抽出件数: mall={target.mall} / category={target.category} / got={len(candidates)}")
 
-    rows: List[List[str]] = []
+    rows_by_rank = {}
     success_count = 0
     fail_count = 0
+    out_of_range_count = 0
+    duplicate_rank_count = 0
 
     for candidate in candidates:
         detail_page = context.new_page()
         try:
             sleep_random()
             detail = extract_detail_info(detail_page, candidate, target.mall)
+
+            if detail.ranking < target.rank_start or detail.ranking > target.rank_end:
+                out_of_range_count += 1
+                log(
+                    f"[INFO] ランキング範囲外スキップ: mall={target.mall} / category={target.category} / "
+                    f"rank={detail.ranking} / url={detail.detail_url}"
+                )
+                continue
+
+            if detail.ranking in rows_by_rank:
+                duplicate_rank_count += 1
+                log(
+                    f"[INFO] 重複順位スキップ: mall={target.mall} / category={target.category} / "
+                    f"rank={detail.ranking} / url={detail.detail_url}"
+                )
+                continue
+
             row = build_csv_row(
                 run_dt=run_dt,
                 mall=target.mall,
-                ranking=candidate.ranking,
                 category=target.category,
                 detail=detail,
             )
-            rows.append(row)
+            rows_by_rank[detail.ranking] = row
             success_count += 1
+
             log(
                 f"[INFO] 詳細取得成功: mall={target.mall} / category={target.category} / "
-                f"rank={candidate.ranking} / url={detail.detail_url}"
+                f"rank={detail.ranking} / url={detail.detail_url}"
             )
         except Exception as e:
             fail_count += 1
             log(
                 f"[WARN] 詳細取得失敗: mall={target.mall} / category={target.category} / "
-                f"rank={candidate.ranking} / url={candidate.detail_url} / error={e}"
+                f"url={candidate.detail_url} / error={e}"
             )
         finally:
             detail_page.close()
 
+    rows = [rows_by_rank[r] for r in sorted(rows_by_rank.keys())]
+
     log(
         f"[INFO] 収集終了: mall={target.mall} / category={target.category} / "
-        f"success={success_count} / fail={fail_count}"
+        f"success={success_count} / fail={fail_count} / out_of_range={out_of_range_count} / "
+        f"duplicate_rank={duplicate_rank_count} / final_rows={len(rows)}"
     )
     return rows
 
