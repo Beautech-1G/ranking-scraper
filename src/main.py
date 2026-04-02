@@ -238,7 +238,6 @@ def normalize_yahoo_product_url(url: str) -> str:
     url = clean_url(url)
     if not url:
         return ""
-
     url = url.replace("-img", "-title")
     url = url.replace("-image", "-title")
     return url
@@ -474,45 +473,56 @@ def extract_ranking_from_text(text: str) -> int:
 
 def extract_maker_from_detail_page(page: Page) -> str:
     try:
-        maker = page.evaluate(
+        candidates = page.evaluate(
             """
             () => {
               const h1 = document.querySelector('h1');
-              if (!h1) return '';
+              if (!h1) return [];
 
-              const reject = (text) => {
-                if (!text) return true;
-                const t = text.trim();
-                if (!t) return true;
-                if (t.length > 40) return true;
-                if (/詳細|最安値|ランキング|レビュー|クーポン|価格|送料無料|件|％|%|円|OFF/i.test(t)) return true;
-                if (/ショップ|Yahoo|ストア|店$/i.test(t)) return true;
-                return false;
-              };
+              const out = [];
+              let node = h1.parentElement;
 
-              let container = h1;
-              for (let i = 0; i < 4 && container; i++) {
-                const anchors = Array.from(container.querySelectorAll('a'));
-                const candidates = anchors.filter(a => {
+              for (let depth = 0; depth < 5 && node; depth++) {
+                const links = Array.from(node.querySelectorAll('a'));
+                for (const a of links) {
                   const text = (a.textContent || '').trim();
-                  if (reject(text)) return false;
+                  if (!text) continue;
 
                   const pos = a.compareDocumentPosition(h1);
-                  return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
-                });
+                  const isBeforeH1 = Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
+                  if (!isBeforeH1) continue;
 
-                if (candidates.length > 0) {
-                  return (candidates[candidates.length - 1].textContent || '').trim();
+                  out.push(text);
                 }
-
-                container = container.parentElement;
+                node = node.parentElement;
               }
 
-              return '';
+              return out;
             }
             """
         )
-        return normalize_text(maker)
+
+        if not isinstance(candidates, list):
+            return ""
+
+        cleaned: List[str] = []
+        for item in candidates:
+            text = normalize_text(str(item))
+            if not text:
+                continue
+            if len(text) > 40:
+                continue
+            if re.search(r"詳細|最安値|ランキング|レビュー|クーポン|価格|送料無料|件|％|%|円|OFF", text, flags=re.IGNORECASE):
+                continue
+            if re.search(r"Yahoo|ショッピング|ストア|ショップ|公式通販|店$", text, flags=re.IGNORECASE):
+                continue
+            cleaned.append(text)
+
+        if not cleaned:
+            return ""
+
+        # 末尾寄りがブランド名である可能性を優先
+        return cleaned[-1]
     except Exception:
         return ""
 
@@ -913,7 +923,7 @@ def collect_target_rows(context: BrowserContext, target: Target, run_dt: datetim
 
             log(
                 f"[INFO] 詳細取得成功: mall={target.mall} / category={target.category} / "
-                f"rank={detail.ranking} / url={detail.detail_url}"
+                f"rank={detail.ranking} / url={detail.detail_url} / maker={detail.maker_name}"
             )
         except Exception as e:
             fail_count += 1
