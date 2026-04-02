@@ -79,7 +79,6 @@ class RankingCandidate:
     list_price_text: str = ""
     list_direct_discount_text: str = ""
     list_coupon_text: str = ""
-    list_maker_text: str = ""
 
 
 @dataclass
@@ -240,7 +239,6 @@ def normalize_yahoo_product_url(url: str) -> str:
     if not url:
         return ""
 
-    # -img / -image を -title に寄せる
     url = url.replace("-img", "-title")
     url = url.replace("-image", "-title")
     return url
@@ -276,8 +274,8 @@ def extract_direct_discount_text(text: str) -> str:
 
     patterns = [
         r"([0-9]{1,3}\s*[%％]\s*OFF価格)",
-        r"([0-9]{1,3}\s*[%％]\s*OFF)",
-        r"([0-9]{1,3}\s*[%％]\s*オフ)",
+        r"([0-9]{1,3}\s*[%％]\s*OFF(?!クーポン))",
+        r"([0-9]{1,3}\s*[%％]\s*オフ(?!クーポン))",
     ]
 
     for p in patterns:
@@ -348,7 +346,7 @@ def infer_product_name(title: str, maker_name: str = "") -> str:
         "シャワーヘッド", "ドライヤー", "ヘアアイロン", "ストレートアイロン",
         "カールアイロン", "2way", "2WAY", "ナノバブル", "ウルトラファインバブル",
         "マイクロナノバブル", "ファインバブル", "ミスト", "節水", "増圧",
-        "脱塩素", "高洗浄力", "毛穴汚れ除去", "美肌", "美髪", "手元止水", "6段階"
+        "脱塩素", "高洗浄力", "毛穴汚れ除去", "美肌", "美髪", "手元止水", "6段階",
     ]
     cleaned = title
     for w in generic_phrases:
@@ -368,13 +366,17 @@ def infer_product_name(title: str, maker_name: str = "") -> str:
                 meaningful.append(token)
                 if i + 1 < len(tokens):
                     nxt = tokens[i + 1]
-                    if re.search(r"[A-Za-z0-9-]{2,}", nxt) or re.search(r"(zero|u|plus|pro|fbu|fbus)", nxt, flags=re.IGNORECASE):
+                    if re.search(r"[A-Za-z0-9-]{2,}", nxt) or re.search(
+                        r"(zero|u|plus|pro|fbu|fbus)",
+                        nxt,
+                        flags=re.IGNORECASE,
+                    ):
                         meaningful.append(nxt)
                 break
 
     stop_tokens = {
         "ランキング", "通販", "モデル", "価格", "対応", "搭載", "専用",
-        "ヘッド", "シャワー", "美容", "家電", "用品"
+        "ヘッド", "シャワー", "美容", "家電", "用品",
     }
 
     for token in tokens:
@@ -470,6 +472,51 @@ def extract_ranking_from_text(text: str) -> int:
     return 0
 
 
+def extract_maker_from_detail_page(page: Page) -> str:
+    try:
+        maker = page.evaluate(
+            """
+            () => {
+              const h1 = document.querySelector('h1');
+              if (!h1) return '';
+
+              const reject = (text) => {
+                if (!text) return true;
+                const t = text.trim();
+                if (!t) return true;
+                if (t.length > 40) return true;
+                if (/詳細|最安値|ランキング|レビュー|クーポン|価格|送料無料|件|％|%|円|OFF/i.test(t)) return true;
+                if (/ショップ|Yahoo|ストア|店$/i.test(t)) return true;
+                return false;
+              };
+
+              let container = h1;
+              for (let i = 0; i < 4 && container; i++) {
+                const anchors = Array.from(container.querySelectorAll('a'));
+                const candidates = anchors.filter(a => {
+                  const text = (a.textContent || '').trim();
+                  if (reject(text)) return false;
+
+                  const pos = a.compareDocumentPosition(h1);
+                  return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
+                });
+
+                if (candidates.length > 0) {
+                  return (candidates[candidates.length - 1].textContent || '').trim();
+                }
+
+                container = container.parentElement;
+              }
+
+              return '';
+            }
+            """
+        )
+        return normalize_text(maker)
+    except Exception:
+        return ""
+
+
 def build_csv_row(
     run_dt: datetime,
     mall: str,
@@ -514,24 +561,31 @@ def build_row_key_from_csv_row(row: List[str]) -> Tuple[str, str, str, str, str]
 # Yahoo! 一覧ページの取得
 # =========================================================
 def click_more_if_visible(page: Page) -> bool:
-    selectors = [
-        "text=もっと見る",
-        "button:has-text('もっと見る')",
-        "a:has-text('もっと見る')",
-        '[aria-label*="もっと見る"]',
-    ]
+    try:
+        clicked = page.evaluate(
+            """
+            () => {
+              const nodes = Array.from(document.querySelectorAll('button, a, div, span'));
+              for (const el of nodes) {
+                const text = (el.textContent || '').trim();
+                if (!text) continue;
+                if (!text.includes('もっと見る')) continue;
 
-    for selector in selectors:
-        try:
-            loc = page.locator(selector).first
-            if loc.count() > 0 and loc.is_visible():
-                loc.scroll_into_view_if_needed()
-                page.wait_for_timeout(500)
-                loc.click(timeout=3000)
-                page.wait_for_timeout(1500)
-                return True
-        except Exception:
-            continue
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0) continue;
+
+                el.click();
+                return true;
+              }
+              return false;
+            }
+            """
+        )
+        if clicked:
+            page.wait_for_timeout(1500)
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -539,49 +593,34 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
     last_count = 0
     stable = 0
 
-    for i in range(60):
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    for i in range(80):
+        page.evaluate(
+            """
+            () => {
+              const step = Math.max(window.innerHeight * 0.9, 700);
+              window.scrollBy(0, step);
+            }
+            """
+        )
         page.wait_for_timeout(SCROLL_WAIT_MS)
 
         clicked = click_more_if_visible(page)
-        if clicked:
-            page.wait_for_timeout(1500)
 
         count = page.evaluate(
             """
             () => {
-              const headingCandidates = Array.from(document.querySelectorAll('*'));
-              const brandHeading = headingCandidates.find(el => {
-                const t = (el.textContent || '').trim();
-                return t === 'ブランド別 ランキング';
-              });
-
-              function isBeforeBrandSection(el) {
-                if (!brandHeading) return true;
-                const pos = el.compareDocumentPosition(brandHeading);
-                return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
-              }
-
-              function normalizeUrl(href) {
-                if (!href) return '';
-                let u = href;
-                u = u.replace('-img', '-title');
-                u = u.replace('-image', '-title');
-                return u;
-              }
-
               const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
               const urlSet = new Set();
 
               for (const a of anchors) {
-                const href = a.href || '';
+                let href = a.href || '';
                 if (!href.includes('store.shopping.yahoo.co.jp')) continue;
-                if (!isBeforeBrandSection(a)) continue;
 
-                const normalized = normalizeUrl(href);
-                if (!normalized.includes('-title')) continue;
+                href = href.replace('-img', '-title');
+                href = href.replace('-image', '-title');
 
-                urlSet.add(normalized);
+                if (!href.includes('-title')) continue;
+                urlSet.add(href);
               }
 
               return urlSet.size;
@@ -599,10 +638,13 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
         else:
             stable = 0
 
-        if stable >= 5:
+        if stable >= 8:
             return
 
         last_count = count
+
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.wait_for_timeout(2000)
 
 
 def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List[RankingCandidate]:
@@ -611,18 +653,6 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
     data = page.evaluate(
         """
         () => {
-          const headingCandidates = Array.from(document.querySelectorAll('*'));
-          const brandHeading = headingCandidates.find(el => {
-            const t = (el.textContent || '').trim();
-            return t === 'ブランド別 ランキング';
-          });
-
-          function isBeforeBrandSection(el) {
-            if (!brandHeading) return true;
-            const pos = el.compareDocumentPosition(brandHeading);
-            return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
-          }
-
           function normalizeUrl(href) {
             if (!href) return '';
             let u = href;
@@ -635,20 +665,20 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             let node = el;
             let best = el.parentElement || el;
 
-            for (let i = 0; i < 12 && node; i++) {
+            for (let i = 0; i < 14 && node; i++) {
               const text = (node.innerText || '').trim();
-              const anchorCount = node.querySelectorAll ? node.querySelectorAll('a').length : 0;
+              if (!text) {
+                node = node.parentElement;
+                continue;
+              }
 
               if (
-                text &&
-                (
-                  /円/.test(text) ||
-                  /ランキング/.test(text) ||
-                  /PR/.test(text) ||
-                  /件/.test(text) ||
-                  /OFF/.test(text)
-                ) &&
-                anchorCount >= 2
+                /円/.test(text) ||
+                /ランキング/.test(text) ||
+                /PR/.test(text) ||
+                /件/.test(text) ||
+                /OFF/.test(text) ||
+                /クーポン/.test(text)
               ) {
                 best = node;
               }
@@ -659,59 +689,26 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             return best;
           }
 
-          function getMakerText(card, titleAnchor) {
-            const cardAnchors = Array.from(card.querySelectorAll('a'));
-            const preceding = cardAnchors.filter(a => {
-              if (a === titleAnchor) return false;
-              const text = (a.textContent || '').trim();
-              if (!text) return false;
-
-              const pos = a.compareDocumentPosition(titleAnchor);
-              return Boolean(pos & Node.DOCUMENT_POSITION_FOLLOWING);
-            });
-
-            const cleaned = preceding
-              .map(a => (a.textContent || '').trim())
-              .filter(t =>
-                t &&
-                !/^最安値を見る$/.test(t) &&
-                !/件/.test(t) &&
-                !/ランキング/.test(t) &&
-                !/OFF/.test(t) &&
-                !/円/.test(t) &&
-                !/ショップ$/.test(t) &&
-                !/店$/.test(t) &&
-                t !== 'PR' &&
-                t !== '詳細'
-              );
-
-            if (cleaned.length === 0) return '';
-            return cleaned[cleaned.length - 1];
-          }
-
           const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
           const rows = [];
           const urlSeen = new Set();
 
           for (const a of anchors) {
-            const href = a.href || '';
-            if (!href.includes('store.shopping.yahoo.co.jp')) continue;
-            if (!isBeforeBrandSection(a)) continue;
+            const rawHref = a.href || '';
+            if (!rawHref.includes('store.shopping.yahoo.co.jp')) continue;
 
-            const normalized = normalizeUrl(href);
+            const normalized = normalizeUrl(rawHref);
             if (!normalized.includes('-title')) continue;
             if (urlSeen.has(normalized)) continue;
 
             const card = findCard(a);
             const cardText = (card.innerText || '').trim();
             const title = ((a.textContent || '').trim() || (a.getAttribute('title') || '').trim());
-            const maker = getMakerText(card, a);
 
             rows.push({
               url: normalized,
               title: title,
-              nearbyText: cardText,
-              maker: maker
+              nearbyText: cardText
             });
 
             urlSeen.add(normalized);
@@ -731,7 +728,6 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
 
         nearby = normalize_text(item.get("nearbyText", ""))
         title = normalize_text(item.get("title", ""))
-        maker = normalize_text(item.get("maker", ""))
 
         direct_discount_text = extract_direct_discount_text(nearby)
         coupon_text = ""
@@ -746,7 +742,6 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
                 list_price_text=extract_first_int_price(nearby),
                 list_direct_discount_text=direct_discount_text,
                 list_coupon_text=coupon_text,
-                list_maker_text=maker,
             )
         )
 
@@ -848,7 +843,7 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
     )
 
     detail_url = page.url
-    maker_name = candidate.list_maker_text
+    maker_name = extract_maker_from_detail_page(page)
     product_name = infer_product_name(product_title, maker_name)
 
     return DetailInfo(
