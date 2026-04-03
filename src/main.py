@@ -649,24 +649,14 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
 def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List[RankingCandidate]:
     auto_expand_yahoo(page, target_rank=rank_end)
 
-    links = page.locator("a[href*='store.shopping.yahoo.co.jp']").all()
+    items = page.locator("li").filter(has=page.locator("a[href*='store.shopping.yahoo.co.jp']")).all()
 
     results: List[RankingCandidate] = []
     seen_rank = set()
 
-    for link in links:
+    for item in items:
         try:
-            url = normalize_yahoo_product_url(link.get_attribute("href") or "")
-            if not url:
-                continue
-
-            # 親カード取得（重要）
-            card = link.locator("xpath=ancestor::*[contains(., '円')][1]")
-
-            if card.count() == 0:
-                continue
-
-            text = normalize_text(card.inner_text())
+            text = normalize_text(item.inner_text())
 
             # 除外
             if "ブランド別ランキング" in text:
@@ -686,11 +676,35 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             if ranking in seen_rank:
                 continue
 
+            link = item.locator("a[href*='store.shopping.yahoo.co.jp']").first
+            if link.count() == 0:
+                continue
+
+            url = normalize_yahoo_product_url(link.get_attribute("href") or "")
             title = normalize_text(link.inner_text())
+
+            # 価格（元ロジック復活）
             price = extract_first_int_price(text)
 
+            # 値引き（元ロジック復活）
             direct = extract_direct_discount_text(text)
             coupon = "" if direct else extract_coupon_text(text)
+
+            # メーカー（一覧の上部のみ）
+            maker = ""
+            spans = item.locator("span").all()
+            for s in spans:
+                t = normalize_text(s.inner_text())
+                if not t:
+                    continue
+                if len(t) > 30:
+                    continue
+                if re.search(r"円|OFF|クーポン|レビュー|件", t):
+                    continue
+                if t == title:
+                    continue
+                maker = t
+                break
 
             results.append(
                 RankingCandidate(
@@ -700,7 +714,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
                     list_price_text=price,
                     list_direct_discount_text=direct,
                     list_coupon_text=coupon,
-                    list_maker_text="",  # ここでは取らない
+                    list_maker_text=maker,
                 )
             )
 
