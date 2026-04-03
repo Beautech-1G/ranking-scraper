@@ -356,36 +356,6 @@ def strip_leading_maker_from_title(title: str, maker_name: str) -> str:
     return title
 
 
-def infer_maker_from_title(title: str) -> str:
-    title = remove_brackets_prefix(title)
-    title = normalize_text(title)
-
-    if not title:
-        return ""
-
-    tokens = [t for t in re.split(r"[\s　]+", title) if t]
-    if not tokens:
-        return ""
-
-    generic_head_words = {
-        "シャワーヘッド", "ドライヤー", "ヘアドライヤー", "ヘアアイロン",
-        "ストレートアイロン", "カールアイロン", "脱毛器", "オーラル",
-        "電動歯ブラシ", "口腔洗浄器", "ブラシ", "アイロン",
-    }
-
-    first = tokens[0]
-    if first in generic_head_words:
-        return ""
-
-    if re.search(r"(公式通販|公式|最新モデル|正規品|送料無料|限定|ランキング)", first, flags=re.IGNORECASE):
-        return ""
-
-    if len(first) <= 20:
-        return first
-
-    return ""
-
-
 def infer_product_name(title: str, maker_name: str = "") -> str:
     title = remove_brackets_prefix(title)
     title = normalize_text(title)
@@ -445,8 +415,6 @@ def split_maker_and_product(product_title: str, maker_from_page: str, list_maker
     maker_name = normalize_text(maker_from_page)
     if not maker_name:
         maker_name = normalize_text(list_maker_text)
-    if not maker_name:
-        maker_name = infer_maker_from_title(product_title)
 
     product_name = infer_product_name(product_title, maker_name)
 
@@ -561,36 +529,54 @@ def click_more_if_visible(page: Page) -> bool:
         clicked = page.evaluate(
             """
             () => {
+              const clean = (t) => (t || '').replace(/\\s+/g, ' ').trim();
               const elements = Array.from(document.querySelectorAll('button, a, span, div'));
 
+              let best = null;
+              let bestTop = -1;
+
               for (const el of elements) {
-                const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                const text = clean(el.textContent);
                 if (text !== 'もっと見る') continue;
 
                 const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0) continue;
+                if (rect.width < 250 || rect.height < 24) continue;
+                if (rect.width > window.innerWidth * 0.95) continue;
+                if (rect.top < 0 || rect.bottom > window.innerHeight + 20) continue;
 
                 const href = (el.getAttribute && el.getAttribute('href')) || '';
                 if (href) continue;
 
+                const centerX = rect.left + rect.width / 2;
+                const screenCenterX = window.innerWidth / 2;
+                if (Math.abs(centerX - screenCenterX) > window.innerWidth * 0.2) continue;
+
                 const cls = (el.className || '').toString();
                 const role = (el.getAttribute && el.getAttribute('role')) || '';
-
                 if (
-                  /more|More|load|expand|button|btn/i.test(cls) ||
-                  role === 'button' ||
-                  el.tagName === 'BUTTON'
+                  !/more|More|load|expand|button|btn/i.test(cls) &&
+                  role !== 'button' &&
+                  el.tagName !== 'BUTTON'
                 ) {
-                  el.click();
-                  return true;
+                  continue;
+                }
+
+                if (rect.top > bestTop) {
+                  best = el;
+                  bestTop = rect.top;
                 }
               }
-              return false;
+
+              if (!best) return false;
+
+              best.scrollIntoView({ block: 'center' });
+              best.click();
+              return true;
             }
             """
         )
         if clicked:
-            page.wait_for_timeout(1800)
+            page.wait_for_timeout(2200)
             return True
     except Exception:
         pass
@@ -603,33 +589,40 @@ def count_main_ranking_title_urls(page: Page) -> int:
             page.evaluate(
                 """
                 () => {
-                  const rows = [];
-                  const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
+                  function normalizeUrl(href) {
+                    if (!href) return '';
+                    let u = href;
+                    u = u.replace('-img', '-title');
+                    u = u.replace('-image', '-title');
+                    return u;
+                  }
+
+                  function isProductUrl(href) {
+                    if (!href) return false;
+                    if (!href.includes('store.shopping.yahoo.co.jp')) return false;
+                    if (href.includes('/brand/')) return false;
+                    if (!href.includes('-title')) return false;
+                    return true;
+                  }
+
                   const seen = new Set();
+                  const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
 
                   for (const a of anchors) {
-                    let href = a.href || '';
-                    if (!href.includes('store.shopping.yahoo.co.jp')) continue;
-                    if (href.includes('/brand/')) continue;
-                    if (href.includes('-img')) continue;
-                    href = href.replace('-image', '-title');
-                    if (!href.includes('-title')) continue;
+                    const rawHref = a.href || '';
+                    const normalized = normalizeUrl(rawHref);
+                    if (!isProductUrl(normalized)) continue;
 
-                    const text = (a.textContent || '').replace(/\\s+/g, ' ').trim();
-                    if (!text) continue;
+                    const title = (a.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (!title) continue;
 
-                    const card = a.closest('li, section, article, div');
-                    const cardText = (card?.innerText || '').replace(/\\s+/g, ' ').trim();
+                    const rect = a.getBoundingClientRect();
+                    if (rect.width === 0 || rect.height === 0) continue;
 
-                    if (/このランキングを見る/.test(cardText)) continue;
-                    if (/ブランド別ランキング/.test(cardText)) continue;
-
-                    if (!seen.has(href)) {
-                      seen.add(href);
-                      rows.push(href);
-                    }
+                    seen.add(normalized);
                   }
-                  return rows.length;
+
+                  return seen.size;
                 }
                 """
             )
@@ -642,34 +635,51 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
     last_count = 0
     stable = 0
 
-    for i in range(150):
+    for i in range(160):
+        count = count_main_ranking_title_urls(page)
+        log(f"[INFO] Yahoo! 展開前 {i + 1}回目 / detected_title_count={count}")
+
+        if count >= target_rank:
+            return
+
+        clicked = click_more_if_visible(page)
+        if clicked:
+            new_count = count_main_ranking_title_urls(page)
+            log(f"[INFO] Yahoo! もっと見る押下 / after_count={new_count}")
+            if new_count >= target_rank:
+                return
+            if new_count == count:
+                stable += 1
+            else:
+                stable = 0
+            last_count = new_count
+            continue
+
         page.evaluate(
             """
             () => {
-              const step = Math.max(window.innerHeight * 0.95, 800);
+              const step = Math.max(window.innerHeight * 0.9, 700);
               window.scrollBy(0, step);
             }
             """
         )
         page.wait_for_timeout(SCROLL_WAIT_MS)
 
-        clicked = click_more_if_visible(page)
-        count = count_main_ranking_title_urls(page)
+        new_count = count_main_ranking_title_urls(page)
+        log(f"[INFO] Yahoo! スクロール / after_count={new_count}")
 
-        log(f"[INFO] Yahoo! 展開 {i + 1}回目 / detected_title_count={count} / clicked_more={clicked}")
-
-        if count >= target_rank:
+        if new_count >= target_rank:
             return
 
-        if count == last_count and not clicked:
+        if new_count == last_count:
             stable += 1
         else:
             stable = 0
 
-        if stable >= 15:
+        if stable >= 20:
             break
 
-        last_count = count
+        last_count = new_count
 
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     page.wait_for_timeout(2500)
@@ -725,7 +735,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             return best;
           }
 
-          function pickListMaker(card, anchor) {
+          function pickListMaker(anchor) {
             const clean = (t) => (t || '').replace(/\\s+/g, ' ').trim();
             const bad = (t) => {
               if (!t) return true;
@@ -736,31 +746,23 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
               return false;
             };
 
+            const titleRect = anchor.getBoundingClientRect();
             const candidates = [];
 
-            const titleAnchor = anchor;
-            if (titleAnchor) {
-              let prev = titleAnchor.previousElementSibling;
-              for (let i = 0; i < 4 && prev; i++) {
-                const t = clean(prev.textContent);
-                if (!bad(t)) candidates.push(t);
-                prev = prev.previousElementSibling;
+            let prev = anchor.previousElementSibling;
+            for (let i = 0; i < 4 && prev; i++) {
+              const t = clean(prev.textContent);
+              const r = prev.getBoundingClientRect();
+
+              if (
+                !bad(t) &&
+                r.bottom <= titleRect.top + 8 &&
+                Math.abs(r.left - titleRect.left) <= 40 &&
+                r.width <= 220
+              ) {
+                candidates.push(t);
               }
-            }
-
-            if (card) {
-              const all = Array.from(card.querySelectorAll('span, a, div, p'));
-              for (const el of all) {
-                const t = clean(el.textContent);
-                if (!bad(t)) continue;
-
-                const rect = el.getBoundingClientRect();
-                const aRect = anchor.getBoundingClientRect();
-
-                if (rect.bottom <= aRect.top + 8 && rect.left <= aRect.left + 100) {
-                  candidates.push(t);
-                }
-              }
+              prev = prev.previousElementSibling;
             }
 
             const uniq = [...new Set(candidates)];
@@ -780,19 +782,13 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             const rect = a.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) continue;
 
-            const card = findCard(a);
-            const cardText = (card?.innerText || '').trim();
-
-            if (/このランキングを見る/.test(cardText)) continue;
-            if (/ブランド別ランキング/.test(cardText)) continue;
-
-            const title =
-              ((a.textContent || '').trim() || (a.getAttribute('title') || '').trim());
-
+            const title = ((a.textContent || '').trim() || (a.getAttribute('title') || '').trim());
             if (!title) continue;
             if (urlSeen.has(normalized)) continue;
 
-            const listMaker = pickListMaker(card, a);
+            const card = findCard(a);
+            const cardText = (card?.innerText || '').trim();
+            const listMaker = pickListMaker(a);
 
             rows.push({
               url: normalized,
@@ -886,30 +882,28 @@ def extract_maker_from_detail_page(page: Page) -> str:
               const h1 = document.querySelector('h1');
               if (!h1) return '';
 
+              const h1Rect = h1.getBoundingClientRect();
               const candidates = [];
 
               let node = h1.previousElementSibling;
-              for (let i = 0; i < 8 && node; i++) {
+              for (let i = 0; i < 5 && node; i++) {
                 const t = clean(node.textContent);
-                if (!bad(t)) candidates.push(t);
+                const r = node.getBoundingClientRect();
 
-                const nested = Array.from(node.querySelectorAll('a, span, div, p'));
-                for (const el of nested) {
-                  const text = clean(el.textContent);
-                  const rect = el.getBoundingClientRect();
-                  const h1Rect = h1.getBoundingClientRect();
-                  if (rect.bottom <= h1Rect.top + 8 && !bad(text)) {
-                    candidates.push(text);
-                  }
+                if (
+                  !bad(t) &&
+                  r.bottom <= h1Rect.top + 8 &&
+                  Math.abs(r.left - h1Rect.left) <= 40 &&
+                  r.width <= 220
+                ) {
+                  candidates.push(t);
                 }
-
                 node = node.previousElementSibling;
               }
 
               const uniq = [...new Set(candidates)];
               if (!uniq.length) return '';
 
-              uniq.sort((a, b) => a.length - b.length);
               return uniq[0];
             }
             """
