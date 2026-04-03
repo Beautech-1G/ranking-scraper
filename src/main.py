@@ -649,21 +649,32 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
 def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List[RankingCandidate]:
     auto_expand_yahoo(page, target_rank=rank_end)
 
-    cards = page.locator("li").all()
+    links = page.locator("a[href*='store.shopping.yahoo.co.jp']").all()
 
     results: List[RankingCandidate] = []
+    seen_rank = set()
 
-    for card in cards:
+    for link in links:
         try:
+            url = normalize_yahoo_product_url(link.get_attribute("href") or "")
+            if not url:
+                continue
+
+            # 親カード取得（重要）
+            card = link.locator("xpath=ancestor::*[contains(., '円')][1]")
+
+            if card.count() == 0:
+                continue
+
             text = normalize_text(card.inner_text())
 
-            # ブランドランキング除外
+            # 除外
             if "ブランド別ランキング" in text:
                 continue
             if "このランキングを見る" in text:
                 continue
 
-            # ランキング取得
+            # ランキング
             m = re.search(r"([1-9][0-9]?|100)\s*位", text)
             if not m:
                 continue
@@ -672,40 +683,14 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             if ranking < rank_start or ranking > rank_end:
                 continue
 
-            # URL取得
-            link = card.locator("a[href*='store.shopping.yahoo.co.jp']").first
-            if link.count() == 0:
+            if ranking in seen_rank:
                 continue
 
-            url = normalize_yahoo_product_url(link.get_attribute("href") or "")
-            if not url:
-                continue
-
-            # タイトル
             title = normalize_text(link.inner_text())
-
-            # 価格
             price = extract_first_int_price(text)
 
-            # 値引き
             direct = extract_direct_discount_text(text)
             coupon = "" if direct else extract_coupon_text(text)
-
-            # メーカー候補（タイトル直上の短いテキスト）
-            maker = ""
-            spans = card.locator("span").all()
-            for s in spans:
-                t = normalize_text(s.inner_text())
-                if not t:
-                    continue
-                if len(t) > 30:
-                    continue
-                if re.search(r"円|OFF|クーポン|レビュー|件", t):
-                    continue
-                if t == title:
-                    continue
-                maker = t
-                break
 
             results.append(
                 RankingCandidate(
@@ -715,25 +700,17 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
                     list_price_text=price,
                     list_direct_discount_text=direct,
                     list_coupon_text=coupon,
-                    list_maker_text=maker,
+                    list_maker_text="",  # ここでは取らない
                 )
             )
+
+            seen_rank.add(ranking)
 
         except Exception:
             continue
 
-    # 重複排除
-    seen = set()
-    final = []
-    for r in results:
-        if r.ranking in seen:
-            continue
-        seen.add(r.ranking)
-        final.append(r)
-
-    final.sort(key=lambda x: x.ranking)
-
-    return final
+    results.sort(key=lambda x: x.ranking)
+    return results
 
 
 # =========================================================
