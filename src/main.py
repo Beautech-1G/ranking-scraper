@@ -580,9 +580,9 @@ def count_detected_ranks(page: Page) -> int:
             () => {
               const nums = new Set();
               const text = (document.body.innerText || '').replace(/\\s+/g, ' ');
-              const matches = text.match(/\\b([1-9][0-9]?|100)位\\b/g) || [];
+              const matches = text.match(/([1-9][0-9]?|100)\\s*位/g) || [];
               for (const m of matches) {
-                const n = parseInt(m.replace('位', ''), 10);
+                const n = parseInt(m.replace(/\\s*位/, ''), 10);
                 if (n >= 1 && n <= 100) nums.add(n);
               }
               return nums.size;
@@ -757,7 +757,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             if (/このランキングを見る/.test(cardText)) continue;
             if (/ブランド別ランキング/.test(cardText)) continue;
 
-            const m = cardText.match(/(?:^|\\s)([1-9][0-9]?|100)位(?:\\s|$)/);
+            const m = cardText.match(/([1-9][0-9]?|100)\\s*位/);
             if (!m) continue;
 
             const ranking = parseInt(m[1], 10);
