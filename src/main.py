@@ -649,181 +649,91 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
 def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List[RankingCandidate]:
     auto_expand_yahoo(page, target_rank=rank_end)
 
-    data = page.evaluate(
-        """
-        ({ rank_start, rank_end }) => {
-          function clean(t) {
-            return (t || '').replace(/\\s+/g, ' ').trim();
-          }
+    cards = page.locator("li").all()
 
-          function normalizeUrl(href) {
-            if (!href) return '';
-            let u = href;
-            u = u.replace('-img', '-title');
-            u = u.replace('-image', '-title');
-            return u;
-          }
+    results: List[RankingCandidate] = []
 
-          function isProductUrl(href) {
-            if (!href) return false;
-            if (!href.includes('store.shopping.yahoo.co.jp')) return false;
-            if (href.includes('/brand/')) return false;
-            if (!href.includes('-title')) return false;
-            return true;
-          }
+    for card in cards:
+        try:
+            text = normalize_text(card.inner_text())
 
-          function findCard(el) {
-            let node = el;
-            let best = el.parentElement || el;
+            # ブランドランキング除外
+            if "ブランド別ランキング" in text:
+                continue
+            if "このランキングを見る" in text:
+                continue
 
-            for (let i = 0; i < 18 && node; i++) {
-              const text = clean(node.innerText);
-              if (!text) {
-                node = node.parentElement;
-                continue;
-              }
-              if (/円|ランキング|件|OFF|クーポン|送料無料|最安値を見る|PR/.test(text)) {
-                best = node;
-              }
-              node = node.parentElement;
-            }
-            return best;
-          }
+            # ランキング取得
+            m = re.search(r"([1-9][0-9]?|100)\s*位", text)
+            if not m:
+                continue
 
-          function badMakerText(t) {
-            if (!t) return true;
-            if (t.length > 40) return true;
-            if (/円|OFF|クーポン|ランキング|レビュー|件|送料無料|最安値/i.test(t)) return true;
-            if (/Yahoo!ショッピング店|ストア|ショップ/.test(t)) return true;
-            if (/このランキングを見る|ブランド別ランキング|選べるカラー/.test(t)) return true;
-            if (/^[\\[【(].*[\\]】)]$/.test(t)) return true;
-            return false;
-          }
+            ranking = int(m.group(1))
+            if ranking < rank_start or ranking > rank_end:
+                continue
 
-          function pickListMaker(anchor) {
-            const titleRect = anchor.getBoundingClientRect();
-            const candidates = [];
+            # URL取得
+            link = card.locator("a[href*='store.shopping.yahoo.co.jp']").first
+            if link.count() == 0:
+                continue
 
-            let prev = anchor.previousElementSibling;
-            for (let i = 0; i < 4 && prev; i++) {
-              const t = clean(prev.textContent);
-              const r = prev.getBoundingClientRect();
+            url = normalize_yahoo_product_url(link.get_attribute("href") or "")
+            if not url:
+                continue
 
-              if (
-                !badMakerText(t) &&
-                r.bottom <= titleRect.top + 8 &&
-                Math.abs(r.left - titleRect.left) <= 50 &&
-                r.width <= 260
-              ) {
-                candidates.push(t);
-              }
+            # タイトル
+            title = normalize_text(link.inner_text())
 
-              const nested = Array.from(prev.querySelectorAll('a, span, div, p'));
-              for (const el of nested) {
-                const tt = clean(el.textContent);
-                const rr = el.getBoundingClientRect();
-                if (
-                  !badMakerText(tt) &&
-                  rr.bottom <= titleRect.top + 8 &&
-                  Math.abs(rr.left - titleRect.left) <= 50 &&
-                  rr.width <= 260
-                ) {
-                  candidates.push(tt);
-                }
-              }
+            # 価格
+            price = extract_first_int_price(text)
 
-              prev = prev.previousElementSibling;
-            }
+            # 値引き
+            direct = extract_direct_discount_text(text)
+            coupon = "" if direct else extract_coupon_text(text)
 
-            const uniq = [...new Set(candidates)];
-            return uniq.length ? uniq[0] : '';
-          }
+            # メーカー候補（タイトル直上の短いテキスト）
+            maker = ""
+            spans = card.locator("span").all()
+            for s in spans:
+                t = normalize_text(s.inner_text())
+                if not t:
+                    continue
+                if len(t) > 30:
+                    continue
+                if re.search(r"円|OFF|クーポン|レビュー|件", t):
+                    continue
+                if t == title:
+                    continue
+                maker = t
+                break
 
-          const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
-          const rows = [];
-          const seenRank = new Set();
-          const seenUrl = new Set();
-
-          for (const a of anchors) {
-            const normalized = normalizeUrl(a.href || '');
-            if (!isProductUrl(normalized)) continue;
-
-            const title = clean(a.textContent || a.getAttribute('title') || '');
-            if (!title) continue;
-
-            const card = findCard(a);
-            const cardText = clean(card?.innerText || '');
-
-            if (/このランキングを見る/.test(cardText)) continue;
-            if (/ブランド別ランキング/.test(cardText)) continue;
-
-            const m = cardText.match(/([1-9][0-9]?|100)\\s*位/);
-            if (!m) continue;
-
-            const ranking = parseInt(m[1], 10);
-            if (!(ranking >= rank_start && ranking <= rank_end)) continue;
-
-            if (seenRank.has(ranking)) continue;
-            if (seenUrl.has(normalized)) continue;
-
-            rows.push({
-              ranking: ranking,
-              url: normalized,
-              title: title,
-              nearbyText: cardText,
-              listMakerText: pickListMaker(a)
-            });
-
-            seenRank.add(ranking);
-            seenUrl.add(normalized);
-          }
-
-          rows.sort((a, b) => a.ranking - b.ranking);
-          return rows;
-        }
-        """,
-        {"rank_start": rank_start, "rank_end": rank_end}
-    )
-
-    if not isinstance(data, list):
-        return []
-
-    candidates: List[RankingCandidate] = []
-
-    for item in data:
-        ranking = int(item.get("ranking", 0))
-        if ranking < rank_start or ranking > rank_end:
-            continue
-
-        url = normalize_yahoo_product_url(item.get("url", ""))
-        if not url:
-            continue
-        if "/brand/" in url:
-            continue
-
-        nearby = normalize_text(item.get("nearbyText", ""))
-        title = normalize_text(item.get("title", ""))
-        list_maker_text = normalize_text(item.get("listMakerText", ""))
-
-        direct_discount_text = extract_direct_discount_text(nearby)
-        coupon_text = ""
-        if not direct_discount_text:
-            coupon_text = extract_coupon_text(nearby)
-
-        candidates.append(
-            RankingCandidate(
-                ranking=ranking,
-                detail_url=url,
-                list_title=title,
-                list_price_text=extract_first_int_price(nearby),
-                list_direct_discount_text=direct_discount_text,
-                list_coupon_text=coupon_text,
-                list_maker_text=list_maker_text,
+            results.append(
+                RankingCandidate(
+                    ranking=ranking,
+                    detail_url=url,
+                    list_title=title,
+                    list_price_text=price,
+                    list_direct_discount_text=direct,
+                    list_coupon_text=coupon,
+                    list_maker_text=maker,
+                )
             )
-        )
 
-    candidates.sort(key=lambda x: x.ranking)
-    return candidates
+        except Exception:
+            continue
+
+    # 重複排除
+    seen = set()
+    final = []
+    for r in results:
+        if r.ranking in seen:
+            continue
+        seen.add(r.ranking)
+        final.append(r)
+
+    final.sort(key=lambda x: x.ranking)
+
+    return final
 
 
 # =========================================================
