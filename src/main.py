@@ -78,6 +78,7 @@ class RankingCandidate:
     list_price_text: str = ""
     list_direct_discount_text: str = ""
     list_coupon_text: str = ""
+    list_maker_text: str = ""
 
 
 @dataclass
@@ -440,8 +441,10 @@ def infer_product_name(title: str, maker_name: str = "") -> str:
     return fallback[:30]
 
 
-def split_maker_and_product(product_title: str, maker_from_page: str) -> Tuple[str, str]:
+def split_maker_and_product(product_title: str, maker_from_page: str, list_maker_text: str) -> Tuple[str, str]:
     maker_name = normalize_text(maker_from_page)
+    if not maker_name:
+        maker_name = normalize_text(list_maker_text)
     if not maker_name:
         maker_name = infer_maker_from_title(product_title)
 
@@ -558,17 +561,29 @@ def click_more_if_visible(page: Page) -> bool:
         clicked = page.evaluate(
             """
             () => {
-              const nodes = Array.from(document.querySelectorAll('button, a, div, span'));
-              for (const el of nodes) {
-                const text = (el.textContent || '').trim();
-                if (!text) continue;
-                if (!text.includes('もっと見る')) continue;
+              const elements = Array.from(document.querySelectorAll('button, a, span, div'));
+
+              for (const el of elements) {
+                const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+                if (text !== 'もっと見る') continue;
 
                 const rect = el.getBoundingClientRect();
                 if (rect.width === 0 || rect.height === 0) continue;
 
-                el.click();
-                return true;
+                const href = (el.getAttribute && el.getAttribute('href')) || '';
+                if (href) continue;
+
+                const cls = (el.className || '').toString();
+                const role = (el.getAttribute && el.getAttribute('role')) || '';
+
+                if (
+                  /more|More|load|expand|button|btn/i.test(cls) ||
+                  role === 'button' ||
+                  el.tagName === 'BUTTON'
+                ) {
+                  el.click();
+                  return true;
+                }
               }
               return false;
             }
@@ -588,6 +603,7 @@ def count_main_ranking_title_urls(page: Page) -> int:
             page.evaluate(
                 """
                 () => {
+                  const rows = [];
                   const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
                   const seen = new Set();
 
@@ -598,10 +614,22 @@ def count_main_ranking_title_urls(page: Page) -> int:
                     if (href.includes('-img')) continue;
                     href = href.replace('-image', '-title');
                     if (!href.includes('-title')) continue;
-                    seen.add(href);
-                  }
 
-                  return seen.size;
+                    const text = (a.textContent || '').replace(/\\s+/g, ' ').trim();
+                    if (!text) continue;
+
+                    const card = a.closest('li, section, article, div');
+                    const cardText = (card?.innerText || '').replace(/\\s+/g, ' ').trim();
+
+                    if (/このランキングを見る/.test(cardText)) continue;
+                    if (/ブランド別ランキング/.test(cardText)) continue;
+
+                    if (!seen.has(href)) {
+                      seen.add(href);
+                      rows.push(href);
+                    }
+                  }
+                  return rows.length;
                 }
                 """
             )
@@ -614,7 +642,7 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
     last_count = 0
     stable = 0
 
-    for i in range(120):
+    for i in range(150):
         page.evaluate(
             """
             () => {
@@ -638,12 +666,8 @@ def auto_expand_yahoo(page: Page, target_rank: int = 100) -> None:
         else:
             stable = 0
 
-        if stable >= 12:
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(2500)
-            final_count = count_main_ranking_title_urls(page)
-            if final_count >= target_rank:
-                return
+        if stable >= 15:
+            break
 
         last_count = count
 
@@ -677,7 +701,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             let node = el;
             let best = el.parentElement || el;
 
-            for (let i = 0; i < 14 && node; i++) {
+            for (let i = 0; i < 16 && node; i++) {
               const text = (node.innerText || '').trim();
               if (!text) {
                 node = node.parentElement;
@@ -701,6 +725,48 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             return best;
           }
 
+          function pickListMaker(card, anchor) {
+            const clean = (t) => (t || '').replace(/\\s+/g, ' ').trim();
+            const bad = (t) => {
+              if (!t) return true;
+              if (t.length > 40) return true;
+              if (/円|OFF|クーポン|ランキング|レビュー|件|送料無料|最安値/i.test(t)) return true;
+              if (/Yahoo!ショッピング店|ストア|ショップ/.test(t)) return true;
+              if (/このランキングを見る|ブランド別ランキング/.test(t)) return true;
+              return false;
+            };
+
+            const candidates = [];
+
+            const titleAnchor = anchor;
+            if (titleAnchor) {
+              let prev = titleAnchor.previousElementSibling;
+              for (let i = 0; i < 4 && prev; i++) {
+                const t = clean(prev.textContent);
+                if (!bad(t)) candidates.push(t);
+                prev = prev.previousElementSibling;
+              }
+            }
+
+            if (card) {
+              const all = Array.from(card.querySelectorAll('span, a, div, p'));
+              for (const el of all) {
+                const t = clean(el.textContent);
+                if (!bad(t)) continue;
+
+                const rect = el.getBoundingClientRect();
+                const aRect = anchor.getBoundingClientRect();
+
+                if (rect.bottom <= aRect.top + 8 && rect.left <= aRect.left + 100) {
+                  candidates.push(t);
+                }
+              }
+            }
+
+            const uniq = [...new Set(candidates)];
+            return uniq.length ? uniq[0] : '';
+          }
+
           const anchors = Array.from(document.querySelectorAll('a[href*="store.shopping.yahoo.co.jp"]'));
           const rows = [];
           const urlSeen = new Set();
@@ -710,20 +776,29 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
             const normalized = normalizeUrl(rawHref);
 
             if (!isProductUrl(normalized)) continue;
-            if (urlSeen.has(normalized)) continue;
 
             const rect = a.getBoundingClientRect();
             if (rect.width === 0 || rect.height === 0) continue;
 
             const card = findCard(a);
             const cardText = (card?.innerText || '').trim();
+
+            if (/このランキングを見る/.test(cardText)) continue;
+            if (/ブランド別ランキング/.test(cardText)) continue;
+
             const title =
               ((a.textContent || '').trim() || (a.getAttribute('title') || '').trim());
+
+            if (!title) continue;
+            if (urlSeen.has(normalized)) continue;
+
+            const listMaker = pickListMaker(card, a);
 
             rows.push({
               url: normalized,
               title: title,
               nearbyText: cardText,
+              listMakerText: listMaker,
               top: rect.top
             });
 
@@ -751,6 +826,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
 
         nearby = normalize_text(item.get("nearbyText", ""))
         title = normalize_text(item.get("title", ""))
+        list_maker_text = normalize_text(item.get("listMakerText", ""))
 
         direct_discount_text = extract_direct_discount_text(nearby)
         coupon_text = ""
@@ -765,6 +841,7 @@ def extract_yahoo_candidates(page: Page, rank_start: int, rank_end: int) -> List
                 list_price_text=extract_first_int_price(nearby),
                 list_direct_discount_text=direct_discount_text,
                 list_coupon_text=coupon_text,
+                list_maker_text=list_maker_text,
             )
         )
 
@@ -813,41 +890,27 @@ def extract_maker_from_detail_page(page: Page) -> str:
 
               let node = h1.previousElementSibling;
               for (let i = 0; i < 8 && node; i++) {
-                const text = clean(node.innerText);
-                if (!bad(text)) candidates.push(text);
+                const t = clean(node.textContent);
+                if (!bad(t)) candidates.push(t);
 
-                const links = Array.from(node.querySelectorAll('a, span, div, p'));
-                for (const el of links) {
-                  const t = clean(el.textContent);
-                  if (!bad(t)) candidates.push(t);
+                const nested = Array.from(node.querySelectorAll('a, span, div, p'));
+                for (const el of nested) {
+                  const text = clean(el.textContent);
+                  const rect = el.getBoundingClientRect();
+                  const h1Rect = h1.getBoundingClientRect();
+                  if (rect.bottom <= h1Rect.top + 8 && !bad(text)) {
+                    candidates.push(text);
+                  }
                 }
 
                 node = node.previousElementSibling;
               }
 
-              let parent = h1.parentElement;
-              for (let depth = 0; depth < 4 && parent; depth++) {
-                const links = Array.from(parent.querySelectorAll('a, span, div, p'));
-                for (const el of links) {
-                  const text = clean(el.textContent);
-                  if (!text) continue;
-                  if (el === h1) continue;
-
-                  const rect = el.getBoundingClientRect();
-                  const h1Rect = h1.getBoundingClientRect();
-
-                  if (rect.bottom <= h1Rect.top + 5) {
-                    if (!bad(text)) candidates.push(text);
-                  }
-                }
-                parent = parent.parentElement;
-              }
-
-              const uniq = [...new Set(candidates.map(clean).filter(Boolean))];
-              if (uniq.length === 0) return '';
+              const uniq = [...new Set(candidates)];
+              if (!uniq.length) return '';
 
               uniq.sort((a, b) => a.length - b.length);
-              return uniq[0] || '';
+              return uniq[0];
             }
             """
         )
@@ -947,7 +1010,11 @@ def extract_detail_info(page: Page, candidate: RankingCandidate, mall: str) -> D
 
     detail_url = page.url
     maker_from_page = extract_maker_from_detail_page(page)
-    maker_name, product_name = split_maker_and_product(product_title, maker_from_page)
+    maker_name, product_name = split_maker_and_product(
+        product_title,
+        maker_from_page,
+        candidate.list_maker_text,
+    )
 
     return DetailInfo(
         ranking=candidate.ranking,
